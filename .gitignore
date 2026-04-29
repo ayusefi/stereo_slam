@@ -1,0 +1,9 @@
+build/
+.cache/
+.vscode/
+*.o
+*.a
+compile_commands.json
+
+# Documentation kept locally only — never pushed.
+docs/

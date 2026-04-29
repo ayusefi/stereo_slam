@@ -1,0 +1,29 @@
+# KITTI Odometry default config. Most intrinsics are read from the sequence's
+# own calib.txt — values here are tracking/mapping thresholds we'll start
+# tuning in Phase 1+.
+dataset: kitti
+
+frontend:
+  type: orb              # orb | superpoint  (Phase 9 adds the second)
+  num_features: 2000
+  scale_factor: 1.2
+  num_levels: 8
+  fast_th_init: 20
+  fast_th_min: 7
+
+stereo:
+  max_disparity: 128
+  min_disparity: 1
+
+tracking:
+  min_inliers_pnp: 30
+  keyframe_min_translation_m: 0.5
+  keyframe_min_rotation_deg: 5.0
+  keyframe_min_inlier_ratio: 0.75
+
+local_mapping:
+  local_ba_keyframe_window: 10
+  cull_redundant_kfs: true
+
+loop:
+  enabled: false         # turned on in Phase 4

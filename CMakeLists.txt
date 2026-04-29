@@ -1,0 +1,54 @@
+cmake_minimum_required(VERSION 3.20)
+project(sslam VERSION 0.0.1 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
+
+# --- Dependencies (system) -----------------------------------------------
+find_package(Eigen3 3.3 REQUIRED NO_MODULE)
+find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc highgui calib3d features2d)
+find_package(spdlog QUIET)
+find_package(fmt QUIET)
+
+# --- Vendored header-only deps -------------------------------------------
+add_library(sophus INTERFACE)
+target_include_directories(sophus INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/Sophus
+)
+target_link_libraries(sophus INTERFACE Eigen3::Eigen)
+
+# --- Library -------------------------------------------------------------
+add_library(sslam
+    src/camera/stereo_camera.cpp
+    src/dataset/kitti_loader.cpp
+    src/frontend/orb_extractor.cpp
+)
+
+target_include_directories(sslam PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_link_libraries(sslam PUBLIC
+    Eigen3::Eigen
+    sophus
+    ${OpenCV_LIBS}
+)
+
+if(spdlog_FOUND)
+    target_link_libraries(sslam PUBLIC spdlog::spdlog)
+    target_compile_definitions(sslam PUBLIC SSLAM_HAVE_SPDLOG=1)
+endif()
+
+# --- Apps ----------------------------------------------------------------
+add_subdirectory(apps)
+
+# --- Tests ---------------------------------------------------------------
+enable_testing()
+add_subdirectory(tests)
