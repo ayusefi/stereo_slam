@@ -29,6 +29,7 @@ add_library(sslam
     src/camera/stereo_camera.cpp
     src/dataset/kitti_loader.cpp
     src/frontend/orb_extractor.cpp
+    src/frontend/stereo_matcher.cpp
 )
 
 target_include_directories(sslam PUBLIC
