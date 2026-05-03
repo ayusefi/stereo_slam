@@ -30,6 +30,7 @@ add_library(sslam
     src/dataset/kitti_loader.cpp
     src/frontend/orb_extractor.cpp
     src/frontend/stereo_matcher.cpp
+    src/frontend/feature_matcher.cpp
 )
 
 target_include_directories(sslam PUBLIC

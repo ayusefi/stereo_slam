@@ -11,6 +11,7 @@
 // Usage:  ./kitti_stereo <kitti-sequence-dir> [--no-display]
 
 #include "sslam/dataset/kitti_loader.hpp"
+#include "sslam/frontend/feature_matcher.hpp"
 #include "sslam/frontend/orb_extractor.hpp"
 #include "sslam/frontend/stereo_matcher.hpp"
 #include "sslam/types/frame.hpp"
@@ -45,13 +46,19 @@ int main(int argc, char** argv) {
                   << "  baseline : " << cam_ptr->baseline << " m\n";
 
         sslam::ORBExtractor extractor;
-        sslam::StereoMatcher matcher(cam_ptr);
+        sslam::StereoMatcher  stereo_matcher(cam_ptr);
+        sslam::FeatureMatcher feature_matcher(cam_ptr);
 
         const std::string win = "sslam :: stereo matches";
         if (display) cv::namedWindow(win, cv::WINDOW_AUTOSIZE);
 
-        double total_ms    = 0.0;
-        double total_ratio = 0.0;
+        double total_ms       = 0.0;
+        double total_s_ratio  = 0.0;  // stereo match ratio
+        double total_f_matches = 0.0; // frame-to-frame match count
+        std::size_t n_frame_pairs = 0;
+
+        sslam::Frame prev_frame;  // carry across iterations
+        bool has_prev = false;
 
         for (std::size_t i = 0; i < loader.size(); ++i) {
             auto raw = loader.load(i);
@@ -65,12 +72,24 @@ int main(int argc, char** argv) {
             const auto t0 = std::chrono::steady_clock::now();
             extractor.detect(frame.left,  frame.keypoints_left,  frame.descriptors_left);
             extractor.detect(frame.right, right_kps,             right_descs);
-            matcher.match(frame, right_kps, right_descs);
+            stereo_matcher.match(frame, right_kps, right_descs);
             const auto t1 = std::chrono::steady_clock::now();
 
             const double ms =
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
             total_ms += ms;
+
+            // --- Frame-to-frame matching --------------------------------
+            int n_fm = 0;
+            if (has_prev) {
+                // Use prev pose as T_pred (zero-velocity assumption until
+                // the motion model is wired in).
+                const auto fm = feature_matcher.match_by_projection(
+                    prev_frame, frame, prev_frame.T_cw);
+                n_fm = static_cast<int>(fm.size());
+                total_f_matches += n_fm;
+                ++n_frame_pairs;
+            }
 
             // --- Per-frame statistics -----------------------------------
             int n_matched = 0;
@@ -88,7 +107,7 @@ int main(int argc, char** argv) {
                 frame.num_features() > 0
                     ? static_cast<float>(n_matched) / frame.num_features()
                     : 0.0f;
-            total_ratio += ratio;
+            total_s_ratio += ratio;
 
             float mean_depth  = 0.0f;
             float median_depth = 0.0f;
@@ -103,11 +122,15 @@ int main(int argc, char** argv) {
 
             std::cout << "frame " << i
                       << "  kps_L=" << frame.num_features()
-                      << "  matched=" << n_matched
+                      << "  stereo=" << n_matched
                       << "  (" << static_cast<int>(ratio * 100.0f) << "%)"
+                      << "  fm=" << n_fm
                       << "  mean_d=" << mean_depth << " m"
                       << "  med_d="  << median_depth << " m"
                       << "  " << static_cast<int>(ms) << " ms\n";
+
+            prev_frame = frame;
+            has_prev   = true;
 
             // --- Visualisation ------------------------------------------
             if (display) {
@@ -147,9 +170,12 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "\nSummary:"
-                  << "\n  avg latency : " << (total_ms    / loader.size()) << " ms/frame"
-                  << "\n  avg match % : "
-                  << static_cast<int>(total_ratio / loader.size() * 100.0) << "%\n";
+                  << "\n  avg latency   : " << (total_ms / loader.size()) << " ms/frame"
+                  << "\n  avg stereo %  : "
+                  << static_cast<int>(total_s_ratio / loader.size() * 100.0) << "%"
+                  << "\n  avg fm matches: "
+                  << (n_frame_pairs > 0 ? total_f_matches / n_frame_pairs : 0.0)
+                  << "\n";
 
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
