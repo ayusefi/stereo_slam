@@ -73,7 +73,8 @@ FeatureMatcher::FeatureMatcher(std::shared_ptr<const StereoCamera> cam,
 std::vector<std::pair<int, int>> FeatureMatcher::match_by_projection(
     const Frame& prev,
     const Frame& curr,
-    const Eigen::Matrix4d& T_curr_cw) const {
+    const Eigen::Matrix4d& T_curr_cw,
+    float radius_scale) const {
 
     const int W = cam_->width;
     const int H = cam_->height;
@@ -132,7 +133,7 @@ std::vector<std::pair<int, int>> FeatureMatcher::match_by_projection(
         if (u_pred < 0.0 || u_pred >= W || v_pred < 0.0 || v_pred >= H) continue;
 
         // --- Grid search ------------------------------------------------
-        const float radius = params_.search_radius *
+        const float radius = params_.search_radius * radius_scale *
                              std::pow(params_.scale_factor, static_cast<float>(oct));
 
         candidates.clear();

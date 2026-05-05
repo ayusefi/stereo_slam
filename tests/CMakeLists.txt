@@ -15,3 +15,7 @@ add_test(NAME test_orb_extractor COMMAND test_orb_extractor)
 add_executable(test_feature_matcher test_feature_matcher.cpp)
 target_link_libraries(test_feature_matcher PRIVATE sslam GTest::gtest GTest::gtest_main)
 add_test(NAME test_feature_matcher COMMAND test_feature_matcher)
+
+add_executable(test_tracking test_tracking.cpp)
+target_link_libraries(test_tracking PRIVATE sslam GTest::gtest GTest::gtest_main)
+add_test(NAME test_tracking COMMAND test_tracking)

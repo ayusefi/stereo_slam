@@ -41,17 +41,22 @@ class FeatureMatcher {
     /// For each keypoint i in @p prev with depth[i] > 0, the 3-D point is
     /// unprojected from prev's camera frame to world (using prev.T_cw), then
     /// projected into curr using @p T_curr_cw. The best ORB descriptor match
-    /// within a radius of `search_radius * scale_factor^octave` px is kept if
-    /// it passes the Hamming threshold and Lowe ratio test.
+    /// within a radius of `search_radius * scale_factor^octave * radius_scale`
+    /// px is kept if it passes the Hamming threshold and Lowe ratio test.
     ///
-    /// @param prev        Previous frame (must have depth filled).
-    /// @param curr        Current frame (must have keypoints_left / descriptors_left).
-    /// @param T_curr_cw   Predicted world-to-camera SE(3) for @p curr (4×4).
-    /// @return            (prev_idx, curr_idx) pairs for each accepted match.
+    /// @param prev          Previous frame (must have depth filled).
+    /// @param curr          Current frame (must have keypoints_left / descriptors_left).
+    /// @param T_curr_cw     Predicted world-to-camera SE(3) for @p curr (4×4).
+    /// @param radius_scale  Multiplier on the per-octave search radius.
+    ///                      Use > 1 for a wider pass when the motion model
+    ///                      is unavailable or a narrow pass returned too few
+    ///                      matches (e.g. 4.0 gives ~4× the search area).
+    /// @return              (prev_idx, curr_idx) pairs for each accepted match.
     std::vector<std::pair<int, int>> match_by_projection(
         const Frame& prev,
         const Frame& curr,
-        const Eigen::Matrix4d& T_curr_cw) const;
+        const Eigen::Matrix4d& T_curr_cw,
+        float radius_scale = 1.0f) const;
 
     const Params& params() const { return params_; }
 

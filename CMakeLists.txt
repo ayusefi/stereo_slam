@@ -31,6 +31,7 @@ add_library(sslam
     src/frontend/orb_extractor.cpp
     src/frontend/stereo_matcher.cpp
     src/frontend/feature_matcher.cpp
+    src/tracking/tracking.cpp
 )
 
 target_include_directories(sslam PUBLIC
