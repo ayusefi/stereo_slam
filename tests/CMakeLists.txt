@@ -19,3 +19,7 @@ add_test(NAME test_feature_matcher COMMAND test_feature_matcher)
 add_executable(test_tracking test_tracking.cpp)
 target_link_libraries(test_tracking PRIVATE sslam GTest::gtest GTest::gtest_main)
 add_test(NAME test_tracking COMMAND test_tracking)
+
+add_executable(test_ba test_ba.cpp)
+target_link_libraries(test_ba PRIVATE sslam GTest::gtest GTest::gtest_main)
+add_test(NAME test_ba COMMAND test_ba)

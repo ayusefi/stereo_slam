@@ -1,3 +1,6 @@
 [submodule "thirdparty/Sophus"]
 	path = thirdparty/Sophus
 	url = https://github.com/strasdat/Sophus.git
+[submodule "thirdparty/g2o"]
+	path = thirdparty/g2o
+	url = https://github.com/RainerKuemmerle/g2o.git

@@ -11,6 +11,7 @@
 // Reference: ORB-SLAM2 Tracking.cc::TrackWithMotionModel.
 
 #include "sslam/tracking/tracking.hpp"
+#include "sslam/optim/ba.hpp"
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core/eigen.hpp>
@@ -114,10 +115,14 @@ Tracking::FrameResult Tracking::process_frame(std::size_t idx, double ts,
     const Eigen::Vector3d t_prev_wc =
         -R_prev_T * prev_frame_->T_cw.topRightCorner<3, 1>();
 
-    std::vector<cv::Point3f> pts3d;
-    std::vector<cv::Point2f> pts2d;
+    std::vector<cv::Point3f>    pts3d;
+    std::vector<cv::Point2f>    pts2d;
+    std::vector<Eigen::Vector3d> obs_stereo;  // (u_l, v, u_r) for BA
     pts3d.reserve(n_matches);
     pts2d.reserve(n_matches);
+    obs_stereo.reserve(n_matches);
+
+    const double bf = cam_->fx * cam_->baseline;
 
     for (const auto& [pi, ci] : matches) {
         const float d = prev_frame_->depth[pi];
@@ -133,7 +138,19 @@ Tracking::FrameResult Tracking::process_frame(std::size_t idx, double ts,
         pts3d.push_back({static_cast<float>(p_w.x()),
                          static_cast<float>(p_w.y()),
                          static_cast<float>(p_w.z())});
-        pts2d.push_back(frame->keypoints_left[ci].pt);
+
+        const cv::KeyPoint& kp_curr = frame->keypoints_left[ci];
+        pts2d.push_back(kp_curr.pt);
+
+        // Stereo observation for BA: u_r = u_l - bf/depth.
+        // depth here is the stereo depth from the *previous* frame, which
+        // gives the 3-D point.  For the current frame we only have the left
+        // pixel; derive the virtual u_r from the reconstructed depth.
+        const double z_c = p_c.z();
+        const double u_r = static_cast<double>(kp_curr.pt.x) - bf / z_c;
+        obs_stereo.push_back({static_cast<double>(kp_curr.pt.x),
+                               static_cast<double>(kp_curr.pt.y),
+                               u_r});
     }
 
     if (static_cast<int>(pts3d.size()) < 4) {
@@ -173,14 +190,17 @@ Tracking::FrameResult Tracking::process_frame(std::size_t idx, double ts,
     }
 
     // --- Step 5b: iterative refinement on inliers only ---------------------
-    std::vector<cv::Point3f> pts3d_in;
-    std::vector<cv::Point2f> pts2d_in;
+    std::vector<cv::Point3f>    pts3d_in;
+    std::vector<cv::Point2f>    pts2d_in;
+    std::vector<Eigen::Vector3d> obs_stereo_in;
     pts3d_in.reserve(n_inliers);
     pts2d_in.reserve(n_inliers);
+    obs_stereo_in.reserve(n_inliers);
     for (int k = 0; k < n_inliers; ++k) {
         const int idx = inliers_mat.at<int>(k);
         pts3d_in.push_back(pts3d[static_cast<std::size_t>(idx)]);
         pts2d_in.push_back(pts2d[static_cast<std::size_t>(idx)]);
+        obs_stereo_in.push_back(obs_stereo[static_cast<std::size_t>(idx)]);
     }
     cv::solvePnP(pts3d_in, pts2d_in, K, cv::noArray(),
                  rvec, tvec, /*useExtrinsicGuess=*/true,
@@ -198,6 +218,23 @@ Tracking::FrameResult Tracking::process_frame(std::size_t idx, double ts,
     frame->T_cw(0, 3) = tvec.at<double>(0);
     frame->T_cw(1, 3) = tvec.at<double>(1);
     frame->T_cw(2, 3) = tvec.at<double>(2);
+
+    // --- Step 5c: motion-only BA on the inlier set -------------------------
+    // Build world-point list from inlier pts3d_in.
+    std::vector<Eigen::Vector3d> pts3d_eig;
+    pts3d_eig.reserve(static_cast<std::size_t>(n_inliers));
+    for (const auto& p : pts3d_in) {
+        pts3d_eig.push_back({p.x, p.y, p.z});
+    }
+
+    const auto ba_result = ba::optimize_pose(
+        frame->T_cw, pts3d_eig, obs_stereo_in, *cam_);
+
+    if (ba_result.n_inliers >= params_.min_inliers_pnp) {
+        frame->T_cw = ba_result.T_cw;
+    }
+    // If BA produced fewer inliers than the threshold the PnP result is kept;
+    // the frame is still marked OK since PnP already passed.
 
     // --- Step 6: update motion model and advance prev frame ----------------
     motion_model_.update(frame->T_cw, prev_frame_->T_cw);
