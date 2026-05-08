@@ -14,6 +14,7 @@ add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
 # --- Dependencies (system) -----------------------------------------------
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)
 find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc highgui calib3d features2d)
+find_package(Pangolin REQUIRED)
 find_package(spdlog QUIET)
 find_package(fmt QUIET)
 
@@ -53,6 +54,7 @@ add_library(sslam
     src/types/mappoint.cpp
     src/types/keyframe.cpp
     src/types/map.cpp
+    src/viewer/map_viewer.cpp
 )
 
 target_include_directories(sslam PUBLIC
@@ -63,6 +65,7 @@ target_link_libraries(sslam PUBLIC
     Eigen3::Eigen
     sophus
     ${OpenCV_LIBS}
+    ${Pangolin_LIBRARIES}
     g2o::core
     g2o::stuff
     g2o::types_sba

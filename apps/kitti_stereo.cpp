@@ -15,6 +15,7 @@
 #include "sslam/dataset/kitti_loader.hpp"
 #include "sslam/system.hpp"
 #include "sslam/tracking/tracking.hpp"
+#include "sslam/viewer/map_viewer.hpp"
 
 #include <Eigen/Core>
 
@@ -37,6 +38,7 @@ int main(int argc, char** argv) {
     }
 
     bool        display     = true;
+    bool map_display = true;
     std::string output_path;
     std::size_t max_frames  = std::numeric_limits<std::size_t>::max();
     for (int a = 2; a < argc; ++a) {
@@ -63,6 +65,12 @@ int main(int argc, char** argv) {
                   << "  baseline : " << cam_ptr->baseline << " m\n";
 
         sslam::Tracking tracker(cam_ptr);
+
+        sslam::MapViewer::Ptr viewer;
+        if (map_display) {
+            viewer = std::make_shared<sslam::MapViewer>(tracker.map());
+            viewer->start();
+        }
 
         const std::string win = "sslam :: stereo VO";
         if (display) cv::namedWindow(win, cv::WINDOW_AUTOSIZE);
@@ -112,6 +120,9 @@ int main(int argc, char** argv) {
             if (lost) ++n_lost;
 
             trajectory.push_back(result.frame->T_cw);
+
+            if (viewer)
+                viewer->set_current_pose(result.frame->T_cw);
 
             std::cout << "frame " << i
                       << (lost ? "  [LOST]" : "  [OK]  ")
@@ -168,6 +179,11 @@ int main(int argc, char** argv) {
         if (!output_path.empty()) {
             sslam::save_trajectory_kitti(output_path, trajectory);
             std::cout << "  trajectory   : " << output_path << "\n";
+        }
+
+        if (viewer) {
+            std::cout << "  [viewer] Examine the map. Close the Pangolin window to exit.\n";
+            viewer->wait_until_closed();
         }
 
     } catch (const std::exception& e) {
