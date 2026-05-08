@@ -6,10 +6,15 @@
 #include "sslam/frontend/stereo_matcher.hpp"
 #include "sslam/tracking/motion_model.hpp"
 #include "sslam/types/frame.hpp"
+#include "sslam/types/keyframe.hpp"
+#include "sslam/types/map.hpp"
 
 #include <opencv2/core.hpp>
 
+#include <cstdint>
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace sslam {
 
@@ -49,6 +54,12 @@ class Tracking {
         /// initialised (zero-velocity assumption can be far off).
         float wide_radius_scale{4.0f};
 
+        // --- KeyFrame insertion policy -----------------------------------
+        /// Insert a KF after this many frames since the last one.
+        int   kf_max_frames_since{8};
+        /// Insert a KF if PnP inliers drop below this (degraded tracking).
+        int   kf_min_tracked_points{50};
+
         ORBExtractor::Params   orb{};
         StereoMatcher::Params  stereo{};
         FeatureMatcher::Params feature{};
@@ -78,6 +89,9 @@ class Tracking {
 
     TrackingState state() const { return state_; }
 
+    /// Access the persistent map built during tracking.
+    const Map::Ptr& map() const { return map_; }
+
    private:
     std::shared_ptr<const StereoCamera> cam_;
     Params                              params_;
@@ -87,6 +101,21 @@ class Tracking {
     ConstantVelocityMotionModel         motion_model_;
     Frame::Ptr                          prev_frame_;
     TrackingState                       state_{TrackingState::NOT_INITIALIZED};
+
+    // --- Map and KeyFrame insertion state --------------------------------
+    Map::Ptr      map_;
+    KeyFrame::Ptr last_kf_;
+    uint64_t      next_kf_id_{0};
+    uint64_t      next_mp_id_{0};
+    uint64_t      last_kf_frame_idx_{~uint64_t{0}};
+    int           nframes_since_kf_{0};
+
+    /// Insert a KeyFrame if insertion criteria are met.
+    /// Must be called before updating prev_frame_.
+    void maybe_insert_keyframe(
+        const Frame& curr_frame,
+        const std::vector<std::pair<int, int>>& matches,
+        int n_inliers);
 };
 
 }  // namespace sslam

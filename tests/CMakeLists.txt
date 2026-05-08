@@ -23,3 +23,7 @@ add_test(NAME test_tracking COMMAND test_tracking)
 add_executable(test_ba test_ba.cpp)
 target_link_libraries(test_ba PRIVATE sslam GTest::gtest GTest::gtest_main)
 add_test(NAME test_ba COMMAND test_ba)
+
+add_executable(test_map test_map.cpp)
+target_link_libraries(test_map PRIVATE sslam GTest::gtest GTest::gtest_main)
+add_test(NAME test_map COMMAND test_map)

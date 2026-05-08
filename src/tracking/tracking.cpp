@@ -12,6 +12,9 @@
 
 #include "sslam/tracking/tracking.hpp"
 #include "sslam/optim/ba.hpp"
+#include "sslam/types/keyframe.hpp"
+#include "sslam/types/map.hpp"
+#include "sslam/types/mappoint.hpp"
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core/eigen.hpp>
@@ -54,7 +57,8 @@ Tracking::Tracking(std::shared_ptr<const StereoCamera> cam, const Params& p)
       params_(p),
       orb_extractor_(p.orb),
       stereo_matcher_(cam, p.stereo),
-      feature_matcher_(cam, p.feature) {
+      feature_matcher_(cam, p.feature),
+      map_(std::make_shared<Map>()) {
     if (!cam_) throw std::runtime_error("Tracking: null camera pointer");
 }
 
@@ -79,6 +83,9 @@ Tracking::FrameResult Tracking::process_frame(std::size_t idx, double ts,
         frame->T_cw = Eigen::Matrix4d::Identity();
         state_      = TrackingState::OK;
         prev_frame_ = frame;
+        // Insert the first KeyFrame with no predecessor matches.
+        const std::vector<std::pair<int, int>> no_matches;
+        maybe_insert_keyframe(*frame, no_matches, 0);
         return {frame, state_, n_stereo, 0, 0};
     }
 
@@ -236,12 +243,129 @@ Tracking::FrameResult Tracking::process_frame(std::size_t idx, double ts,
     // If BA produced fewer inliers than the threshold the PnP result is kept;
     // the frame is still marked OK since PnP already passed.
 
+    // --- Step 7: KeyFrame insertion check (before advancing prev_frame_) --
+    maybe_insert_keyframe(*frame, matches, n_inliers);
+
     // --- Step 6: update motion model and advance prev frame ----------------
     motion_model_.update(frame->T_cw, prev_frame_->T_cw);
     prev_frame_ = frame;
     state_      = TrackingState::OK;
 
     return {frame, state_, n_stereo, n_matches, n_inliers};
+}
+
+// ---------------------------------------------------------------------------
+// KeyFrame insertion helpers
+// ---------------------------------------------------------------------------
+
+void Tracking::maybe_insert_keyframe(
+    const Frame& curr_frame,
+    const std::vector<std::pair<int, int>>& /*matches*/,
+    int n_inliers) {
+
+    ++nframes_since_kf_;
+
+    // Criterion A: always insert the very first KeyFrame.
+    const bool must_insert = !last_kf_;
+
+    // Criterion B (roadmap): time-based cadence.
+    const bool time_crit = (nframes_since_kf_ > params_.kf_max_frames_since);
+
+    // Criterion C (roadmap): minimum tracking quality.
+    // Guard n_inliers > 0 so the forced-zero initialisation call doesn't fire it.
+    const bool min_crit = (n_inliers > 0 &&
+                           n_inliers < params_.kf_min_tracked_points);
+
+    if (!must_insert && !time_crit && !min_crit) return;
+
+    // --- Build new KeyFrame -----------------------------------------------
+    auto kf = std::make_shared<KeyFrame>(next_kf_id_++, curr_frame, cam_);
+
+    // --- Propagate MPs from last_kf_ via projection + descriptor matching --
+    // For each MP in last_kf_, project into curr_frame using curr_frame.T_cw,
+    // then scan curr_frame features within a 20 px radius for the best Hamming
+    // match. This propagates MPs across the inter-KF gap without requiring a
+    // continuous frame chain, at O(N_MPs × N_feats_in_radius) cost per KF
+    // insertion (acceptable since KFs are rare — every kf_max_frames_since frames).
+    std::vector<bool> curr_matched(curr_frame.num_features(), false);
+
+    if (last_kf_) {
+        const Eigen::Matrix3d R_cw = curr_frame.T_cw.topLeftCorner<3, 3>();
+        const Eigen::Vector3d t_cw = curr_frame.T_cw.topRightCorner<3, 1>();
+
+        const auto& kps_curr   = curr_frame.keypoints_left;
+        const auto& desc_curr  = curr_frame.descriptors_left;
+        const int   n_curr     = static_cast<int>(kps_curr.size());
+        const float search_r2  = 50.0f * 50.0f;  // 50 px radius (squared)
+        constexpr int kHammingTh = 100;           // TH_HIGH for ORB
+
+        for (int i = 0; i < static_cast<int>(last_kf_->num_features()); ++i) {
+            auto mp = last_kf_->get_map_point(i);
+            if (!mp || mp->is_bad()) continue;
+
+            // Project into curr_frame.
+            const Eigen::Vector3d X_c = R_cw * mp->get_world_pos() + t_cw;
+            if (X_c.z() <= 0.0) continue;
+            const float u_proj = static_cast<float>(
+                cam_->fx * X_c.x() / X_c.z() + cam_->cx);
+            const float v_proj = static_cast<float>(
+                cam_->fy * X_c.y() / X_c.z() + cam_->cy);
+            if (u_proj < 0.0f || u_proj >= cam_->width ||
+                v_proj < 0.0f || v_proj >= cam_->height) continue;
+
+            // Find best unmatched feature in curr_frame within search radius.
+            const cv::Mat desc_i = last_kf_->descriptors_left().row(i);
+            int best_dist  = kHammingTh + 1;
+            int best_j     = -1;
+            for (int j = 0; j < n_curr; ++j) {
+                if (curr_matched[static_cast<std::size_t>(j)]) continue;
+                const float du = kps_curr[static_cast<std::size_t>(j)].pt.x - u_proj;
+                const float dv = kps_curr[static_cast<std::size_t>(j)].pt.y - v_proj;
+                if (du * du + dv * dv > search_r2) continue;
+                const int dist = cv::norm(
+                    desc_i, desc_curr.row(j), cv::NORM_HAMMING);
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_j    = j;
+                }
+            }
+
+            if (best_j >= 0) {
+                kf->add_map_point(best_j, mp);
+                mp->add_observation(kf.get(), best_j);
+                curr_matched[static_cast<std::size_t>(best_j)] = true;
+            }
+        }
+    }
+
+    // --- Create fresh MPs for unmatched stereo-depth features ---------------
+    const Eigen::Matrix3d R_wc =
+        curr_frame.T_cw.topLeftCorner<3, 3>().transpose();
+    const Eigen::Vector3d t_wc =
+        -R_wc * curr_frame.T_cw.topRightCorner<3, 1>();
+
+    for (std::size_t i = 0; i < curr_frame.num_features(); ++i) {
+        if (curr_matched[i]) continue;
+        const float d = curr_frame.depth[i];
+        if (d <= 0.0f || !std::isfinite(d)) continue;
+
+        const auto&   kp   = curr_frame.keypoints_left[i];
+        const double  disp = cam_->fx * cam_->baseline / d;
+        const Eigen::Vector3d X_c = cam_->backproject(kp.pt.x, kp.pt.y, disp);
+        const Eigen::Vector3d X_w = R_wc * X_c + t_wc;
+
+        auto mp = std::make_shared<MapPoint>(next_mp_id_++, X_w, kf.get());
+        mp->add_observation(kf.get(), static_cast<int>(i));
+        kf->add_map_point(static_cast<int>(i), mp);
+        map_->add_mappoint(mp);
+    }
+
+    kf->update_connections();
+    map_->add_keyframe(kf);
+
+    last_kf_           = kf;
+    last_kf_frame_idx_ = curr_frame.index;
+    nframes_since_kf_  = 0;
 }
 
 }  // namespace sslam

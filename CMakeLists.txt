@@ -50,6 +50,9 @@ add_library(sslam
     src/tracking/tracking.cpp
     src/optim/ba.cpp
     src/io/trajectory.cpp
+    src/types/mappoint.cpp
+    src/types/keyframe.cpp
+    src/types/map.cpp
 )
 
 target_include_directories(sslam PUBLIC

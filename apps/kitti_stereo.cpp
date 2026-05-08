@@ -24,24 +24,29 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <string>
 
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: " << argv[0]
-                  << " <kitti-sequence-dir> [--no-display] [--output <traj.txt>]\n";
+                  << " <kitti-sequence-dir> [--no-display] [--output <traj.txt>]"
+                     " [--max-frames N]\n";
         return 1;
     }
 
     bool        display     = true;
     std::string output_path;
+    std::size_t max_frames  = std::numeric_limits<std::size_t>::max();
     for (int a = 2; a < argc; ++a) {
         const std::string arg = argv[a];
         if (arg == "--no-display") {
             display = false;
         } else if (arg == "--output" && a + 1 < argc) {
             output_path = argv[++a];
+        } else if (arg == "--max-frames" && a + 1 < argc) {
+            max_frames = static_cast<std::size_t>(std::stoul(argv[++a]));
         }
     }
 
@@ -69,7 +74,7 @@ int main(int argc, char** argv) {
         std::vector<Eigen::Matrix4d> trajectory;
         trajectory.reserve(loader.size());
 
-        for (std::size_t i = 0; i < loader.size(); ++i) {
+        for (std::size_t i = 0; i < std::min(loader.size(), max_frames); ++i) {
             const auto raw = loader.load(i);
 
             const auto t0 = std::chrono::steady_clock::now();
@@ -151,11 +156,14 @@ int main(int argc, char** argv) {
             }
         }
 
+        const std::size_t n_frames_run = std::min(loader.size(), max_frames);
         std::cout << "\nSummary:"
-                  << "\n  avg latency  : " << (total_ms / loader.size()) << " ms/frame"
+                  << "\n  avg latency  : " << (total_ms / n_frames_run) << " ms/frame"
                   << "\n  avg stereo % : "
-                  << static_cast<int>(total_s_ratio / loader.size() * 100.0) << "%"
-                  << "\n  lost frames  : " << n_lost << " / " << loader.size() << "\n";
+                  << static_cast<int>(total_s_ratio / n_frames_run * 100.0) << "%"
+                  << "\n  lost frames  : " << n_lost << " / " << n_frames_run
+                  << "\n  keyframes    : " << tracker.map()->keyframe_count()
+                  << "\n  map points   : " << tracker.map()->mappoint_count() << "\n";
 
         if (!output_path.empty()) {
             sslam::save_trajectory_kitti(output_path, trajectory);
