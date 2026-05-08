@@ -10,10 +10,13 @@
 //
 // Per-frame stats printed to stdout: state, stereo %, fm matches, PnP inliers.
 //
-// Usage:  ./kitti_stereo <kitti-sequence-dir> [--no-display]
+// Usage:  ./kitti_stereo <kitti-sequence-dir> [--no-display] [--output <traj.txt>]
 
 #include "sslam/dataset/kitti_loader.hpp"
+#include "sslam/system.hpp"
 #include "sslam/tracking/tracking.hpp"
+
+#include <Eigen/Core>
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
@@ -27,10 +30,20 @@
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: " << argv[0]
-                  << " <kitti-sequence-dir> [--no-display]\n";
+                  << " <kitti-sequence-dir> [--no-display] [--output <traj.txt>]\n";
         return 1;
     }
-    const bool display = !(argc >= 3 && std::string(argv[2]) == "--no-display");
+
+    bool        display     = true;
+    std::string output_path;
+    for (int a = 2; a < argc; ++a) {
+        const std::string arg = argv[a];
+        if (arg == "--no-display") {
+            display = false;
+        } else if (arg == "--output" && a + 1 < argc) {
+            output_path = argv[++a];
+        }
+    }
 
     try {
         sslam::KittiLoader loader(argv[1]);
@@ -52,6 +65,9 @@ int main(int argc, char** argv) {
         double      total_ms      = 0.0;
         double      total_s_ratio = 0.0;
         std::size_t n_lost        = 0;
+
+        std::vector<Eigen::Matrix4d> trajectory;
+        trajectory.reserve(loader.size());
 
         for (std::size_t i = 0; i < loader.size(); ++i) {
             const auto raw = loader.load(i);
@@ -89,6 +105,8 @@ int main(int argc, char** argv) {
 
             const bool lost = result.state == sslam::TrackingState::LOST;
             if (lost) ++n_lost;
+
+            trajectory.push_back(result.frame->T_cw);
 
             std::cout << "frame " << i
                       << (lost ? "  [LOST]" : "  [OK]  ")
@@ -138,6 +156,11 @@ int main(int argc, char** argv) {
                   << "\n  avg stereo % : "
                   << static_cast<int>(total_s_ratio / loader.size() * 100.0) << "%"
                   << "\n  lost frames  : " << n_lost << " / " << loader.size() << "\n";
+
+        if (!output_path.empty()) {
+            sslam::save_trajectory_kitti(output_path, trajectory);
+            std::cout << "  trajectory   : " << output_path << "\n";
+        }
 
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";

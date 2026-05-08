@@ -49,6 +49,7 @@ add_library(sslam
     src/frontend/feature_matcher.cpp
     src/tracking/tracking.cpp
     src/optim/ba.cpp
+    src/io/trajectory.cpp
 )
 
 target_include_directories(sslam PUBLIC
