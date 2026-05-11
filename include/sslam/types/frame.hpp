@@ -21,10 +21,10 @@ class KeyFrame;  // forward-declaration; only a non-owning pointer is held.
 ///      stereo matching, `right_u` and `depth` (parallel arrays, same size
 ///      as `keypoints_left`; -1.0f means "no stereo match" → mono only).
 ///   3. Tracking sets `T_cw` (world → camera SE(3)) once a pose is solved.
-///   4. The frame is either dropped or promoted to a `KeyFrame` (Phase 2).
+///   4. The frame is either dropped or promoted to a `KeyFrame`.
 ///
-/// Heavy image data is stored by value here for Phase 1 simplicity. Once
-/// memory pressure becomes real (Phase 2+), we'll move them to shared_ptr
+/// Heavy image data is stored by value here for simplicity. Once
+/// memory pressure becomes real, we'll move them to shared_ptr
 /// and let only KeyFrames retain pixels.
 struct Frame {
     using Ptr = std::shared_ptr<Frame>;
@@ -35,13 +35,13 @@ struct Frame {
     cv::Mat      left;            // CV_8UC1
     cv::Mat      right;           // CV_8UC1
 
-    // --- Filled by the frontend (Phase 1.2 / 1.3) ------------------------
+    // --- Filled by the frontend ----------------------------------------
     std::vector<cv::KeyPoint> keypoints_left;
     cv::Mat                   descriptors_left;   // CV_8U, rows = #keypoints
     std::vector<float>        right_u;            // x in right image, -1 if none
     std::vector<float>        depth;              // metres,   -1 if none
 
-    // --- Filled by tracking (Phase 1.5) ----------------------------------
+    // --- Filled by tracking ----------------------------------
     /// Pose of the world expressed in the camera frame (SE(3)). Identity
     /// for the very first frame.
     Eigen::Matrix4d T_cw{Eigen::Matrix4d::Identity()};

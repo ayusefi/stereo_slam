@@ -1,4 +1,4 @@
-// Unit tests for Map, KeyFrame, and MapPoint — Phase 2 acceptance test.
+// Unit tests for Map, KeyFrame, and MapPoint 
 //
 // Test: build a Map of 5 KFs and 100 MPs with overlapping observations;
 // verify that covisibility edge weights match the hand-computed values and

@@ -113,7 +113,7 @@ Tracking::FrameResult Tracking::process_frame(std::size_t idx, double ts,
     // --- Step 4: build 3-D/2-D correspondences for PnP --------------------
     // Frame-to-frame projection matching against prev_frame_ in the raw VO frame.
     // match_local_map_ (local-map projection) is implemented but disabled until
-    // the two-stage tracker is properly integrated (see ROADMAP.md §3.7.a).
+    // the two-stage tracker is properly integrated.
 
     std::vector<cv::Point3f>     pts3d;
     std::vector<cv::Point2f>     pts2d;
@@ -329,14 +329,14 @@ std::vector<Eigen::Matrix4d> Tracking::resolved_trajectory() const {
 }
 
 // ---------------------------------------------------------------------------
-// match_local_map_ — skeleton for Phase 3.7.a (currently unused)
+// match_local_map_
 // ---------------------------------------------------------------------------
 // Projects MapPoints from last_kf_ into the current frame using T_pred
 // (the current pose estimate in the BA-corrected world frame).  Returns true
 // iff match count >= params_.min_local_map_matches.
 //
 // Disabled until a proper two-stage tracker (TrackWithMotionModel then
-// TrackLocalMap) is implemented; see ROADMAP.md §3.7.a.
+// TrackLocalMap) is implemented.
 // ---------------------------------------------------------------------------
 bool Tracking::match_local_map_(
     const Frame&                  frame,
@@ -464,10 +464,10 @@ void Tracking::maybe_insert_keyframe(
     // Criterion A: always insert the very first KeyFrame.
     const bool must_insert = !last_kf_;
 
-    // Criterion B (roadmap): time-based cadence.
+    // Criterion B: time-based cadence.
     const bool time_crit = (nframes_since_kf_ > params_.kf_max_frames_since);
 
-    // Criterion C (roadmap): minimum tracking quality.
+    // Criterion C: minimum tracking quality.
     // Guard n_inliers > 0 so the forced-zero initialisation call doesn't fire it.
     const bool min_crit = (n_inliers > 0 &&
                            n_inliers < params_.kf_min_tracked_points);

@@ -19,7 +19,7 @@ namespace sslam {
 /// is accepted if it passes the Hamming threshold and the Lowe ratio test.
 ///
 /// This is the "match by projection" path used during normal tracking.
-/// The "match by BoW" path (for relocalization) is added in a later phase.
+/// The "match by BoW" path (for relocalization) is added in a later.
 class FeatureMatcher {
    public:
     struct Params {
