@@ -31,3 +31,13 @@ add_test(NAME test_map COMMAND test_map)
 add_executable(test_local_ba test_local_ba.cpp)
 target_link_libraries(test_local_ba PRIVATE sslam GTest::gtest GTest::gtest_main)
 add_test(NAME test_local_ba COMMAND test_local_ba)
+
+add_executable(test_orb_vocabulary test_orb_vocabulary.cpp)
+target_link_libraries(test_orb_vocabulary PRIVATE sslam GTest::gtest GTest::gtest_main)
+add_test(NAME test_orb_vocabulary COMMAND test_orb_vocabulary
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_keyframe_database test_keyframe_database.cpp)
+target_link_libraries(test_keyframe_database PRIVATE sslam GTest::gtest GTest::gtest_main)
+add_test(NAME test_keyframe_database COMMAND test_keyframe_database
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

@@ -4,6 +4,9 @@
 #include "sslam/types/frame.hpp"
 #include "sslam/types/mappoint.hpp"
 
+#include <DBoW2/BowVector.h>
+#include <DBoW2/FeatureVector.h>
+
 #include <Eigen/Core>
 #include <opencv2/core.hpp>
 
@@ -89,6 +92,25 @@ class KeyFrame {
     KeyFrame* parent() const { return parent_; }
     void      set_parent(KeyFrame* kf) { parent_ = kf; }
 
+    // --- Bag-of-Words (guarded by bow_mutex_) ----------------------------
+
+    /// Compute BoW and FeatureVector from this KF's left descriptors.
+    /// No-op if already computed.  Thread-safe.
+    template <class Vocab>
+    void compute_bow(const Vocab& vocab) {
+        std::scoped_lock lk(bow_mutex_);
+        if (!bow_.empty()) return;
+        std::vector<cv::Mat> descs;
+        descs.reserve(static_cast<std::size_t>(descriptors_left_.rows));
+        for (int i = 0; i < descriptors_left_.rows; ++i)
+            descs.push_back(descriptors_left_.row(i));
+        vocab.transform(descs, bow_, feat_vec_, 4);
+    }
+
+    DBoW2::BowVector   bow()      const { std::scoped_lock lk(bow_mutex_); return bow_; }
+    DBoW2::FeatureVector feat_vec() const { std::scoped_lock lk(bow_mutex_); return feat_vec_; }
+    bool bow_computed()            const { std::scoped_lock lk(bow_mutex_); return !bow_.empty(); }
+
    private:
     const uint64_t id_;
     double         timestamp_{0.0};
@@ -113,6 +135,11 @@ class KeyFrame {
 
     // Spanning tree parent (raw non-owning)
     KeyFrame* parent_{nullptr};
+
+    // --- Guarded by bow_mutex_ -------------------------------------------
+    mutable std::mutex   bow_mutex_;
+    DBoW2::BowVector     bow_;
+    DBoW2::FeatureVector feat_vec_;
 };
 
 }  // namespace sslam

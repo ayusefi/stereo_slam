@@ -1,10 +1,10 @@
 # KITTI Odometry default config. Most intrinsics are read from the sequence's
 # own calib.txt — values here are tracking/mapping thresholds we'll start
-# tuning in Phase 1+.
+# tuning.
 dataset: kitti
 
 frontend:
-  type: orb              # orb | superpoint  (Phase 9 adds the second)
+  type: orb              # orb | superpoint 
   num_features: 2000
   scale_factor: 1.2
   num_levels: 8
@@ -26,4 +26,6 @@ local_mapping:
   cull_redundant_kfs: true
 
 loop:
-  enabled: false         # turned on in Phase 4
+  enabled: true
+  vocab_path: "thirdparty/vocab/ORBvoc.txt"
+  min_bow_score: 0.04

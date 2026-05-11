@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sslam/camera/stereo_camera.hpp"
+#include "sslam/frontend/orb_vocabulary.hpp"
 #include "sslam/optim/ba.hpp"
 #include "sslam/types/keyframe.hpp"
 #include "sslam/types/map.hpp"
@@ -73,6 +74,10 @@ class LocalMapping {
     /// Block until the input queue is empty and the current KF is done.
     void wait_until_idle();
 
+    /// Set vocabulary for BoW computation (call before start()).
+    /// If not set, BoW computation is skipped.
+    void set_vocabulary(const ORBVocabulary* vocab) { vocab_ = vocab; }
+
     /// Snapshot of local BA timing statistics.
     BaStats ba_stats() const;
 
@@ -95,6 +100,7 @@ class LocalMapping {
     // --- Data members ------------------------------------------------------
     Map::Ptr                              map_;
     std::shared_ptr<const StereoCamera>   cam_;
+    const ORBVocabulary*                  vocab_{nullptr};  // non-owning
     Params                                params_;
     ba::Params                            ba_params_;
 

@@ -15,6 +15,7 @@ add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)
 find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc highgui calib3d features2d)
 find_package(Pangolin REQUIRED)
+find_package(ZLIB REQUIRED)
 find_package(spdlog QUIET)
 find_package(fmt QUIET)
 
@@ -41,6 +42,10 @@ set(G2O_BUILD_SIM3_TYPES           OFF CACHE BOOL "" FORCE)
 set(G2O_BUILD_SBA_TYPES            ON  CACHE BOOL "" FORCE)
 add_subdirectory(thirdparty/g2o EXCLUDE_FROM_ALL)
 
+# --- Vendored DBoW2 (place recognition) ----------------------------------
+set(BUILD_Demo OFF CACHE BOOL "" FORCE)
+add_subdirectory(thirdparty/DBoW2 EXCLUDE_FROM_ALL)
+
 # --- Library -------------------------------------------------------------
 add_library(sslam
     src/camera/stereo_camera.cpp
@@ -57,6 +62,9 @@ add_library(sslam
     src/mapping/triangulation.cpp
     src/mapping/local_mapping.cpp
     src/viewer/map_viewer.cpp
+    src/frontend/orb_vocabulary.cpp
+    src/loop/keyframe_database.cpp
+    src/loop/place_recognizer.cpp
 )
 
 target_include_directories(sslam PUBLIC
@@ -73,6 +81,8 @@ target_link_libraries(sslam PUBLIC
     g2o::types_sba
     g2o::solver_dense
     g2o::solver_eigen
+    DBoW2
+    ZLIB::ZLIB
 )
 
 if(spdlog_FOUND)

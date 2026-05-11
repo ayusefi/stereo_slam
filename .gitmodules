@@ -4,3 +4,6 @@
 [submodule "thirdparty/g2o"]
 	path = thirdparty/g2o
 	url = https://github.com/RainerKuemmerle/g2o.git
+[submodule "thirdparty/DBoW2"]
+	path = thirdparty/DBoW2
+	url = https://github.com/dorian3d/DBoW2.git

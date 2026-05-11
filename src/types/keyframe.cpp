@@ -109,7 +109,7 @@ void KeyFrame::update_connections() {
     }
 
     // Step 4: notify peer KFs — they acquire their own obs_mutex_, no nesting.
-    // Phase 3 note: if two KFs call update_connections() concurrently they
+    // note: if two KFs call update_connections() concurrently they
     // may write each other's add_connection simultaneously; acceptable since
     // writes are idempotent and Lock ordering (Map > KF obs) is preserved.
     for (const auto& [other_kf, weight] : kf_counter)
