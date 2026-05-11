@@ -3,6 +3,7 @@
 #include "sslam/types/keyframe.hpp"
 #include "sslam/types/mappoint.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -26,6 +27,9 @@ class Map {
     void add_keyframe(KeyFrame::Ptr kf);
     void add_mappoint(MapPoint::Ptr mp);
 
+    /// Allocate a unique MapPoint id across all map writers.
+    uint64_t allocate_mappoint_id();
+
     std::vector<KeyFrame::Ptr> get_all_keyframes() const;
     std::vector<MapPoint::Ptr> get_all_mappoints() const;
 
@@ -33,7 +37,7 @@ class Map {
     std::size_t mappoint_count() const;
 
     /// Return KeyFrames sharing >= min_shared MapPoint observations with kf,
-    /// sorted descending by shared count.  min_shared = 15 per Phase 2 spec.
+    /// sorted descending by shared count.
     std::vector<KeyFrame::Ptr> local_map_around(const KeyFrame* kf,
                                                 int min_shared = 15) const;
 
@@ -44,6 +48,7 @@ class Map {
    private:
     std::unordered_map<uint64_t, KeyFrame::Ptr> keyframes_;
     std::unordered_map<uint64_t, MapPoint::Ptr> mappoints_;
+    std::atomic<uint64_t> next_mappoint_id_{0};
 };
 
 }  // namespace sslam

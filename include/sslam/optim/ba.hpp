@@ -1,6 +1,8 @@
 #pragma once
 
 #include "sslam/camera/stereo_camera.hpp"
+#include "sslam/types/keyframe.hpp"
+#include "sslam/types/mappoint.hpp"
 
 #include <Eigen/Core>
 
@@ -23,6 +25,11 @@ struct Params {
     double huber_delta{std::sqrt(7.815)};
     /// Chi-squared threshold for inlier/outlier reclassification (3-DoF, 95%).
     double chi2_threshold{7.815};
+    /// Maximum number of covisible KeyFrames to include in the local BA
+    /// window.  Caps the optimisation problem size as the map grows.
+    int max_local_kfs{20};
+    /// Maximum number of MapPoints included in one local BA solve.
+    int max_local_mps{1000};
 };
 
 /// Result of motion-only pose optimisation.
@@ -51,6 +58,32 @@ PoseOptResult optimize_pose(
     const std::vector<Eigen::Vector3d>& obs_stereo,
     const StereoCamera&                 cam,
     const Params&                       p = {});
+
+// ---------------------------------------------------------------------------
+// Local Bundle Adjustment
+// ---------------------------------------------------------------------------
+
+/// Run local BA over a window of KeyFrames and their shared MapPoints.
+///
+/// Local KFs  = kf + its covisibility neighbours (all poses are optimised).
+/// Fixed KFs  = KFs that observe local MPs but are not in the local window
+///              (they anchor the gauge without being updated).
+/// MPs        = all non-bad MapPoints observed by any local KF.
+///
+/// Two-pass optimisation with outlier reclassification between passes.
+/// Uses g2o Schur-complement (sparse Eigen) solver for efficiency.
+///
+/// After optimisation:
+///   - Local KF poses and MP positions are updated in-place.
+///   - Observations with reprojection error above chi2_threshold are
+///     removed from both the KF and the MapPoint.
+///
+/// @param kf     The newly-inserted KeyFrame that triggered this BA.
+/// @param cam    Camera calibration (shared by all KFs in the sequence).
+/// @param p      Optimiser parameters (optional, uses defaults).
+void local_bundle_adjustment(KeyFrame* kf,
+                             const StereoCamera& cam,
+                             const Params& p = {});
 
 }  // namespace ba
 }  // namespace sslam

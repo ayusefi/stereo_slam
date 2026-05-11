@@ -9,7 +9,10 @@
 namespace sslam {
 
 MapPoint::MapPoint(uint64_t id, const Eigen::Vector3d& pos_w, KeyFrame* ref_kf)
-    : id_(id), ref_kf_(ref_kf), pos_w_(pos_w) {}
+        : id_(id),
+            created_kf_id_(ref_kf ? ref_kf->id() : 0),
+            ref_kf_(ref_kf),
+            pos_w_(pos_w) {}
 
 // --- World position ------------------------------------------------------
 

@@ -12,6 +12,10 @@ void Map::add_mappoint(MapPoint::Ptr mp) {
     mappoints_[mp->id()] = std::move(mp);
 }
 
+uint64_t Map::allocate_mappoint_id() {
+    return next_mappoint_id_.fetch_add(1, std::memory_order_relaxed);
+}
+
 std::vector<KeyFrame::Ptr> Map::get_all_keyframes() const {
     std::scoped_lock lk(mutex_);
     std::vector<KeyFrame::Ptr> v;

@@ -7,6 +7,7 @@
 #include <Eigen/Core>
 #include <opencv2/core.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -37,8 +38,8 @@ class KeyFrame {
 
     uint64_t id()        const { return id_; }
     double   timestamp() const { return timestamp_; }
-    bool     is_bad()    const { return bad_; }
-    void     set_bad()         { bad_ = true; }
+    bool     is_bad()    const { return bad_.load(std::memory_order_relaxed); }
+    void     set_bad()         { bad_.store(true, std::memory_order_relaxed); }
 
     // --- Pose (guarded by pose_mutex_) ------------------------------------
 
@@ -84,14 +85,14 @@ class KeyFrame {
     /// Return covisible KFs with weight >= min_weight, sorted descending.
     std::vector<KeyFrame*> get_covisibility_keyframes(int min_weight = 0) const;
 
-    // --- Spanning tree (Phase 3+) ----------------------------------------
+    // --- Spanning tree ----------------------------------------------------
     KeyFrame* parent() const { return parent_; }
     void      set_parent(KeyFrame* kf) { parent_ = kf; }
 
    private:
     const uint64_t id_;
     double         timestamp_{0.0};
-    bool           bad_{false};
+    std::atomic<bool> bad_{false};
 
     std::shared_ptr<const StereoCamera> camera_;
 
@@ -110,7 +111,7 @@ class KeyFrame {
     std::unordered_map<int, MapPoint::Ptr> observations_;  ///< feat_idx → MP (shared ownership)
     std::unordered_map<KeyFrame*, int>     covisibility_;  ///< raw non-owning KF* → shared obs count
 
-    // Spanning tree parent (raw non-owning, Phase 3+)
+    // Spanning tree parent (raw non-owning)
     KeyFrame* parent_{nullptr};
 };
 

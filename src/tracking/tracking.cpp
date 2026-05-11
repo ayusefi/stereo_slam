@@ -20,6 +20,8 @@
 #include <opencv2/core/eigen.hpp>
 
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace sslam {
 
@@ -58,8 +60,10 @@ Tracking::Tracking(std::shared_ptr<const StereoCamera> cam, const Params& p)
       orb_extractor_(p.orb),
       stereo_matcher_(cam, p.stereo),
       feature_matcher_(cam, p.feature),
-      map_(std::make_shared<Map>()) {
+      map_(std::make_shared<Map>()),
+      local_mapping_(std::make_shared<LocalMapping>(map_, cam)) {
     if (!cam_) throw std::runtime_error("Tracking: null camera pointer");
+    local_mapping_->start();
 }
 
 Tracking::FrameResult Tracking::process_frame(std::size_t idx, double ts,
@@ -82,90 +86,103 @@ Tracking::FrameResult Tracking::process_frame(std::size_t idx, double ts,
     if (!prev_frame_) {
         frame->T_cw = Eigen::Matrix4d::Identity();
         state_      = TrackingState::OK;
-        prev_frame_ = frame;
         // Insert the first KeyFrame with no predecessor matches.
         const std::vector<std::pair<int, int>> no_matches;
         maybe_insert_keyframe(*frame, no_matches, 0);
+        anchor_and_record_(*frame);
+        prev_frame_ = frame;
         return {frame, state_, n_stereo, 0, 0};
     }
+
+    // --- Step 2.5: corrected-frame prediction anchor for match_local_map_ --
+    // T_prev_corrected is used only by match_local_map_ (currently disabled).
+    // It must NOT replace prev_frame_->T_cw; that would inject BA
+    // discontinuities into the motion model and break tracking.
+    Eigen::Matrix4d T_prev_corrected = prev_frame_->T_cw;
+    if (prev_frame_->ref_kf && !prev_frame_->ref_kf->is_bad())
+        T_prev_corrected = prev_frame_->T_ref * prev_frame_->ref_kf->get_pose();
+    (void)T_prev_corrected;  // unused until match_local_map_ is re-enabled
 
     // --- Step 3: predict pose with constant-velocity model -----------------
     const Eigen::Matrix4d T_pred = motion_model_.predict(prev_frame_->T_cw);
 
-    // --- Step 4: frame-to-frame projection matching ------------------------
-    // Use the wide search radius unconditionally: KITTI's 10 Hz capture means
-    // even modest turns can shift features 30–50 px between frames, well
-    // outside the default 10 px radius.  When the previous frame was LOST,
-    // the prediction is unreliable, so escalate to a still-wider search.
-    const float radius_scale =
-        (state_ == TrackingState::LOST) ? params_.wide_radius_scale * 2.0f
-                                        : params_.wide_radius_scale;
-    auto matches = feature_matcher_.match_by_projection(
-        *prev_frame_, *frame, T_pred, radius_scale);
-
-    const int n_matches = static_cast<int>(matches.size());
-
-    if (n_matches < 4) {
-        frame->T_cw = prev_frame_->T_cw;  // hold last known pose; T_pred may be wildly off
-        motion_model_.reset();            // stale velocity caused the failure; drop it
-        prev_frame_ = frame;
-        state_ = TrackingState::LOST;
-        return {frame, state_, n_stereo, n_matches, 0};
-    }
-
-    // --- Step 5: build 3-D / 2-D correspondences for PnP ------------------
+    // Camera intrinsics used in PnP and motion-only BA.
     const double fx = cam_->fx, fy = cam_->fy;
     const double cx = cam_->cx, cy = cam_->cy;
 
-    // SE(3) inverse of prev_frame_->T_cw
-    const Eigen::Matrix3d R_prev_T = prev_frame_->T_cw.topLeftCorner<3, 3>().transpose();
-    const Eigen::Vector3d t_prev_wc =
-        -R_prev_T * prev_frame_->T_cw.topRightCorner<3, 1>();
+    // --- Step 4: build 3-D/2-D correspondences for PnP --------------------
+    // Frame-to-frame projection matching against prev_frame_ in the raw VO frame.
+    // match_local_map_ (local-map projection) is implemented but disabled until
+    // the two-stage tracker is properly integrated (see ROADMAP.md §3.7.a).
 
-    std::vector<cv::Point3f>    pts3d;
-    std::vector<cv::Point2f>    pts2d;
-    std::vector<Eigen::Vector3d> obs_stereo;  // (u_l, v, u_r) for BA
-    pts3d.reserve(n_matches);
-    pts2d.reserve(n_matches);
-    obs_stereo.reserve(n_matches);
+    std::vector<cv::Point3f>     pts3d;
+    std::vector<cv::Point2f>     pts2d;
+    std::vector<Eigen::Vector3d> obs_stereo;
+    int n_matches = 0;
+    std::vector<std::pair<int,int>> frame_matches;  // populated only in fallback path
 
-    const double bf = cam_->fx * cam_->baseline;
+    // --- Stage 1: frame-to-frame projection matching ----------------------
+    {
+        // --- Frame-to-frame projection matching ----------------------------
+        const float radius_scale =
+            (state_ == TrackingState::LOST) ? params_.wide_radius_scale * 2.0f
+                                            : params_.wide_radius_scale;
+        frame_matches = feature_matcher_.match_by_projection(
+            *prev_frame_, *frame, T_pred, radius_scale);
+        n_matches = static_cast<int>(frame_matches.size());
 
-    for (const auto& [pi, ci] : matches) {
-        const float d = prev_frame_->depth[pi];
-        if (d <= 0.0f) continue;
+        if (n_matches < 4) {
+            frame->T_cw = prev_frame_->T_cw;
+            motion_model_.reset();
+            anchor_and_record_(*frame);
+            prev_frame_ = frame;
+            state_ = TrackingState::LOST;
+            return {frame, state_, n_stereo, n_matches, 0};
+        }
 
-        const cv::KeyPoint& kp_prev = prev_frame_->keypoints_left[pi];
-        const Eigen::Vector3d p_c(
-            (static_cast<double>(kp_prev.pt.x) - cx) * d / fx,
-            (static_cast<double>(kp_prev.pt.y) - cy) * d / fy,
-            static_cast<double>(d));
-        const Eigen::Vector3d p_w = R_prev_T * p_c + t_prev_wc;
+        // Build PnP correspondences from frame-to-frame matches.
+        // Both prev_frame_->T_cw and the resulting frame->T_cw are in the
+        // raw VO world frame; BA corrections reach the output via resolved_trajectory().
+        const double bf = cam_->fx * cam_->baseline;
 
-        pts3d.push_back({static_cast<float>(p_w.x()),
-                         static_cast<float>(p_w.y()),
-                         static_cast<float>(p_w.z())});
+        const Eigen::Matrix3d R_prev_T =
+            prev_frame_->T_cw.topLeftCorner<3, 3>().transpose();
+        const Eigen::Vector3d t_prev_wc =
+            -R_prev_T * prev_frame_->T_cw.topRightCorner<3, 1>();
 
-        const cv::KeyPoint& kp_curr = frame->keypoints_left[ci];
-        pts2d.push_back(kp_curr.pt);
+        pts3d.reserve(n_matches);
+        pts2d.reserve(n_matches);
+        obs_stereo.reserve(n_matches);
 
-        // Stereo observation for BA: u_r = u_l - bf/depth.
-        // depth here is the stereo depth from the *previous* frame, which
-        // gives the 3-D point.  For the current frame we only have the left
-        // pixel; derive the virtual u_r from the reconstructed depth.
-        const double z_c = p_c.z();
-        const double u_r = static_cast<double>(kp_curr.pt.x) - bf / z_c;
-        obs_stereo.push_back({static_cast<double>(kp_curr.pt.x),
-                               static_cast<double>(kp_curr.pt.y),
-                               u_r});
-    }
+        for (const auto& [pi, ci] : frame_matches) {
+            const float d = prev_frame_->depth[pi];
+            if (d <= 0.0f) continue;
+            const cv::KeyPoint& kp_prev = prev_frame_->keypoints_left[pi];
+            const cv::KeyPoint& kp_curr = frame->keypoints_left[ci];
+            const Eigen::Vector3d p_c(
+                (static_cast<double>(kp_prev.pt.x) - cx) * d / fx,
+                (static_cast<double>(kp_prev.pt.y) - cy) * d / fy,
+                static_cast<double>(d));
+            const Eigen::Vector3d p_w = R_prev_T * p_c + t_prev_wc;
+            pts3d.push_back({static_cast<float>(p_w.x()),
+                             static_cast<float>(p_w.y()),
+                             static_cast<float>(p_w.z())});
+            pts2d.push_back(kp_curr.pt);
+            const double u_r =
+                static_cast<double>(kp_curr.pt.x) - static_cast<double>(bf) / d;
+            obs_stereo.push_back({static_cast<double>(kp_curr.pt.x),
+                                  static_cast<double>(kp_curr.pt.y),
+                                  u_r});
+        }
 
-    if (static_cast<int>(pts3d.size()) < 4) {
-        frame->T_cw = prev_frame_->T_cw;
-        motion_model_.reset();
-        prev_frame_ = frame;
-        state_ = TrackingState::LOST;
-        return {frame, state_, n_stereo, n_matches, 0};
+        if (static_cast<int>(pts3d.size()) < 4) {
+            frame->T_cw = prev_frame_->T_cw;
+            motion_model_.reset();
+            anchor_and_record_(*frame);
+            prev_frame_ = frame;
+            state_ = TrackingState::LOST;
+            return {frame, state_, n_stereo, n_matches, 0};
+        }
     }
 
     // Camera matrix (OpenCV convention)
@@ -191,6 +208,7 @@ Tracking::FrameResult Tracking::process_frame(std::size_t idx, double ts,
     if (!ok || n_inliers < params_.min_inliers_pnp) {
         frame->T_cw = prev_frame_->T_cw;  // hold last known pose; PnP result is unreliable
         motion_model_.reset();            // drop stale velocity so next frame predicts identity
+        anchor_and_record_(*frame);
         prev_frame_ = frame;
         state_ = TrackingState::LOST;
         return {frame, state_, n_stereo, n_matches, n_inliers};
@@ -243,15 +261,193 @@ Tracking::FrameResult Tracking::process_frame(std::size_t idx, double ts,
     // If BA produced fewer inliers than the threshold the PnP result is kept;
     // the frame is still marked OK since PnP already passed.
 
-    // --- Step 7: KeyFrame insertion check (before advancing prev_frame_) --
-    maybe_insert_keyframe(*frame, matches, n_inliers);
+    // --- Step 5d: sanity check — reject catastrophic pose outliers ---------
+    // PnP+RANSAC can pick the "wrong" one of two mirror solutions when the
+    // scene is nearly planar.  Guard against this by checking the camera-centre
+    // jump.  Both poses are in the raw VO frame so the comparison is consistent.
+    {
+        const Eigen::Matrix3d R_c  = frame->T_cw.topLeftCorner<3, 3>();
+        const Eigen::Vector3d c_c  = -R_c.transpose() * frame->T_cw.topRightCorner<3, 1>();
+        const Eigen::Matrix3d R_p  = prev_frame_->T_cw.topLeftCorner<3, 3>();
+        const Eigen::Vector3d c_p  = -R_p.transpose() * prev_frame_->T_cw.topRightCorner<3, 1>();
+        const double jump = (c_c - c_p).norm();
+        if (jump > static_cast<double>(params_.max_frame_translation)) {
+            frame->T_cw = prev_frame_->T_cw;
+            motion_model_.reset();
+            anchor_and_record_(*frame);
+            prev_frame_ = frame;
+            state_ = TrackingState::LOST;
+            return {frame, state_, n_stereo, n_matches, n_inliers};
+        }
+    }
 
-    // --- Step 6: update motion model and advance prev frame ----------------
+    // --- Step 7: KeyFrame insertion check ---------------------------------
+    maybe_insert_keyframe(*frame, frame_matches, n_inliers);
+
+    // --- Step 6: update motion model and advance prev frame ---------------
     motion_model_.update(frame->T_cw, prev_frame_->T_cw);
+    anchor_and_record_(*frame);
     prev_frame_ = frame;
     state_      = TrackingState::OK;
 
     return {frame, state_, n_stereo, n_matches, n_inliers};
+}
+
+// ---------------------------------------------------------------------------
+// Anchor the frame to the latest KeyFrame and append a trajectory entry.
+// ---------------------------------------------------------------------------
+
+void Tracking::anchor_and_record_(Frame& frame) {
+    if (last_kf_ && !last_kf_->is_bad()) {
+        const Eigen::Matrix4d T_kw = last_kf_->get_pose();
+        // SE(3) inverse: T_wk = [R^T | -R^T t]
+        const Eigen::Matrix3d R_T = T_kw.topLeftCorner<3, 3>().transpose();
+        Eigen::Matrix4d T_wk      = Eigen::Matrix4d::Identity();
+        T_wk.topLeftCorner<3, 3>() = R_T;
+        T_wk.topRightCorner<3, 1>() = -R_T * T_kw.topRightCorner<3, 1>();
+        frame.ref_kf = last_kf_.get();
+        frame.T_ref  = frame.T_cw * T_wk;
+        trajectory_entries_.push_back({last_kf_.get(), frame.T_ref, frame.T_cw});
+    } else {
+        frame.ref_kf = nullptr;
+        frame.T_ref  = Eigen::Matrix4d::Identity();
+        trajectory_entries_.push_back({nullptr, Eigen::Matrix4d::Identity(), frame.T_cw});
+    }
+}
+
+std::vector<Eigen::Matrix4d> Tracking::resolved_trajectory() const {
+    std::vector<Eigen::Matrix4d> out;
+    out.reserve(trajectory_entries_.size());
+    for (const auto& e : trajectory_entries_) {
+        if (e.ref_kf && !e.ref_kf->is_bad()) {
+            out.push_back(e.T_ref * e.ref_kf->get_pose());
+        } else {
+            out.push_back(e.T_cw_fallback);
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// match_local_map_ — skeleton for Phase 3.7.a (currently unused)
+// ---------------------------------------------------------------------------
+// Projects MapPoints from last_kf_ into the current frame using T_pred
+// (the current pose estimate in the BA-corrected world frame).  Returns true
+// iff match count >= params_.min_local_map_matches.
+//
+// Disabled until a proper two-stage tracker (TrackWithMotionModel then
+// TrackLocalMap) is implemented; see ROADMAP.md §3.7.a.
+// ---------------------------------------------------------------------------
+bool Tracking::match_local_map_(
+    const Frame&                  frame,
+    const Eigen::Matrix4d&        T_pred,
+    std::vector<cv::Point3f>&     pts3d,
+    std::vector<cv::Point2f>&     pts2d,
+    std::vector<Eigen::Vector3d>& obs_stereo)
+{
+    if (!last_kf_ || last_kf_->is_bad()) return false;
+
+    // Candidate set: last_kf_ only.
+    // The covisibility neighbourhood was tried but brought too many wrong
+    // associations even with Stage 1 providing an accurate initial pose:
+    // dense urban scenes have many MPs projecting within the 35 px radius,
+    // and RANSAC can accept a wrong-consensus set that accidentally has low
+    // reprojection error.
+    std::vector<KeyFrame*> local_kfs{last_kf_.get()};
+
+    // 2. Collect unique non-bad local MPs.
+    std::unordered_set<MapPoint*> seen;
+    std::vector<MapPoint::Ptr>    local_mps;
+    for (KeyFrame* kf : local_kfs) {
+        for (const auto& mp : kf->get_map_points()) {
+            if (!mp || mp->is_bad()) continue;
+            if (seen.insert(mp.get()).second)
+                local_mps.push_back(mp);
+        }
+    }
+    if (local_mps.empty()) return false;
+
+    // Precompute projection constants.
+    const double fx = cam_->fx, fy = cam_->fy;
+    const double cx = cam_->cx, cy = cam_->cy;
+    const double bf = cam_->fx * cam_->baseline;
+    const Eigen::Matrix3d R_pred = T_pred.topLeftCorner<3, 3>();
+    const Eigen::Vector3d t_pred = T_pred.topRightCorner<3, 1>();
+
+    const auto& kps   = frame.keypoints_left;
+    const auto& descs = frame.descriptors_left;
+    const int   n_kp  = static_cast<int>(kps.size());
+
+    std::vector<bool> matched(static_cast<std::size_t>(n_kp), false);
+
+    constexpr int   kTH_HIGH       = 100;
+    constexpr float kNarrowRadius2 = 1225.0f;  // 35 px — normal tracking
+    constexpr float kWideRadius2   = 4900.0f;  // 70 px — after LOST or first frames
+    constexpr float kLoweRatio     = 0.70f;
+
+    // After a LOST recovery the velocity model is reset to identity, so the
+    // prediction error can be large.  Use a wider radius in that case.
+    const float kRadius2 = (state_ == TrackingState::LOST)
+                           ? kWideRadius2 : kNarrowRadius2;
+
+    for (const auto& mp : local_mps) {
+        // Project MP into the current frame using the predicted pose.
+        const Eigen::Vector3d X_c = R_pred * mp->get_world_pos() + t_pred;
+        if (X_c.z() <= 0.0) continue;
+
+        const float u_proj = static_cast<float>(fx * X_c.x() / X_c.z() + cx);
+        const float v_proj = static_cast<float>(fy * X_c.y() / X_c.z() + cy);
+        if (u_proj < 0.0f || u_proj >= static_cast<float>(cam_->width) ||
+            v_proj < 0.0f || v_proj >= static_cast<float>(cam_->height))
+            continue;
+
+        const cv::Mat mp_desc = mp->get_descriptor();
+        if (mp_desc.empty()) continue;
+
+        // 2-best search for Lowe ratio filtering.
+        int best_dist = kTH_HIGH + 1, second_dist = kTH_HIGH + 1, best_j = -1;
+        for (int j = 0; j < n_kp; ++j) {
+            if (matched[static_cast<std::size_t>(j)]) continue;
+            const float du = kps[static_cast<std::size_t>(j)].pt.x - u_proj;
+            const float dv = kps[static_cast<std::size_t>(j)].pt.y - v_proj;
+            if (du * du + dv * dv > kRadius2) continue;
+            const int dist = cv::norm(mp_desc, descs.row(j), cv::NORM_HAMMING);
+            if (dist < best_dist) {
+                second_dist = best_dist;
+                best_dist   = dist;
+                best_j      = j;
+            } else if (dist < second_dist) {
+                second_dist = dist;
+            }
+        }
+
+        if (best_j < 0 || best_dist >= kTH_HIGH) continue;
+        if (second_dist < kTH_HIGH &&
+            best_dist > static_cast<int>(kLoweRatio * second_dist))
+            continue;
+
+        // Record correspondence.
+        matched[static_cast<std::size_t>(best_j)] = true;
+        const Eigen::Vector3d p_w = mp->get_world_pos();
+        pts3d.push_back({static_cast<float>(p_w.x()),
+                         static_cast<float>(p_w.y()),
+                         static_cast<float>(p_w.z())});
+        pts2d.push_back(kps[static_cast<std::size_t>(best_j)].pt);
+
+        // Right-camera observation: prefer the actual stereo match stored on
+        // the frame over the depth derived from the predicted projection.
+        // X_c.z() is the predicted depth (consistent with T_pred, not the
+        // final optimized pose), so using it for u_r would bias BA.
+        const double u_l = static_cast<double>(kps[static_cast<std::size_t>(best_j)].pt.x);
+        const double v_l = static_cast<double>(kps[static_cast<std::size_t>(best_j)].pt.y);
+        const float  d_actual = frame.depth[static_cast<std::size_t>(best_j)];
+        const double u_r = (d_actual > 0.0f)
+            ? u_l - bf / static_cast<double>(d_actual)   // real stereo observation
+            : u_l - bf / X_c.z();                         // fallback: projected depth
+        obs_stereo.push_back({u_l, v_l, u_r});
+    }
+
+    return static_cast<int>(pts3d.size()) >= params_.min_local_map_matches;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,8 +474,25 @@ void Tracking::maybe_insert_keyframe(
 
     if (!must_insert && !time_crit && !min_crit) return;
 
+    // --- Compute the BA-corrected pose for this frame ---------------------
+    // curr_frame.T_cw is the raw VO pose from PnP.  Rebase via the reference
+    // KF so that fresh MPs created here are in the same world frame as the
+    // rest of the map.
+    Eigen::Matrix4d T_cw_corrected = curr_frame.T_cw;
+    if (last_kf_ && !last_kf_->is_bad()) {
+        const Eigen::Matrix4d T_kw = last_kf_->get_pose();
+        const Eigen::Matrix3d R_T  = T_kw.topLeftCorner<3,3>().transpose();
+        Eigen::Matrix4d T_wk = Eigen::Matrix4d::Identity();
+        T_wk.topLeftCorner<3,3>()  = R_T;
+        T_wk.topRightCorner<3,1>() = -R_T * T_kw.topRightCorner<3,1>();
+        // T_ref_curr = curr_frame.T_cw * T_wk (relative to last_kf_ at PnP time)
+        const Eigen::Matrix4d T_ref_curr = curr_frame.T_cw * T_wk;
+        T_cw_corrected = T_ref_curr * T_kw;
+    }
+
     // --- Build new KeyFrame -----------------------------------------------
     auto kf = std::make_shared<KeyFrame>(next_kf_id_++, curr_frame, cam_);
+    kf->set_pose(T_cw_corrected);
 
     // --- Propagate MPs from last_kf_ via projection + descriptor matching --
     // For each MP in last_kf_, project into curr_frame using curr_frame.T_cw,
@@ -290,8 +503,8 @@ void Tracking::maybe_insert_keyframe(
     std::vector<bool> curr_matched(curr_frame.num_features(), false);
 
     if (last_kf_) {
-        const Eigen::Matrix3d R_cw = curr_frame.T_cw.topLeftCorner<3, 3>();
-        const Eigen::Vector3d t_cw = curr_frame.T_cw.topRightCorner<3, 1>();
+        const Eigen::Matrix3d R_cw = T_cw_corrected.topLeftCorner<3, 3>();
+        const Eigen::Vector3d t_cw = T_cw_corrected.topRightCorner<3, 1>();
 
         const auto& kps_curr   = curr_frame.keypoints_left;
         const auto& desc_curr  = curr_frame.descriptors_left;
@@ -340,9 +553,9 @@ void Tracking::maybe_insert_keyframe(
 
     // --- Create fresh MPs for unmatched stereo-depth features ---------------
     const Eigen::Matrix3d R_wc =
-        curr_frame.T_cw.topLeftCorner<3, 3>().transpose();
+        T_cw_corrected.topLeftCorner<3, 3>().transpose();
     const Eigen::Vector3d t_wc =
-        -R_wc * curr_frame.T_cw.topRightCorner<3, 1>();
+        -R_wc * T_cw_corrected.topRightCorner<3, 1>();
 
     for (std::size_t i = 0; i < curr_frame.num_features(); ++i) {
         if (curr_matched[i]) continue;
@@ -354,14 +567,17 @@ void Tracking::maybe_insert_keyframe(
         const Eigen::Vector3d X_c = cam_->backproject(kp.pt.x, kp.pt.y, disp);
         const Eigen::Vector3d X_w = R_wc * X_c + t_wc;
 
-        auto mp = std::make_shared<MapPoint>(next_mp_id_++, X_w, kf.get());
+        auto mp = std::make_shared<MapPoint>(map_->allocate_mappoint_id(), X_w, kf.get());
         mp->add_observation(kf.get(), static_cast<int>(i));
+        mp->compute_descriptor();        // single observation: copies this KF's descriptor
+        mp->update_normal_and_depth();   // initialise scale-invariance range for TrackLocalMap
         kf->add_map_point(static_cast<int>(i), mp);
         map_->add_mappoint(mp);
     }
 
     kf->update_connections();
     map_->add_keyframe(kf);
+    local_mapping_->enqueue_keyframe(kf);
 
     last_kf_           = kf;
     last_kf_frame_idx_ = curr_frame.index;

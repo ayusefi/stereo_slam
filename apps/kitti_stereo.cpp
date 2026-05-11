@@ -24,32 +24,58 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: " << argv[0]
                   << " <kitti-sequence-dir> [--no-display] [--output <traj.txt>]"
-                     " [--max-frames N]\n";
+                     " [--max-frames N] [--gt <poses.txt>]\n";
         return 1;
     }
 
-    bool        display     = true;
-    bool map_display = true;
+    bool        display     = false;
+    bool        map_display = true;
     std::string output_path;
+    std::string gt_path;
     std::size_t max_frames  = std::numeric_limits<std::size_t>::max();
     for (int a = 2; a < argc; ++a) {
         const std::string arg = argv[a];
         if (arg == "--no-display") {
-            display = false;
+            display     = false;
+            map_display = false;
         } else if (arg == "--output" && a + 1 < argc) {
             output_path = argv[++a];
+        } else if (arg == "--gt" && a + 1 < argc) {
+            gt_path = argv[++a];
         } else if (arg == "--max-frames" && a + 1 < argc) {
             max_frames = static_cast<std::size_t>(std::stoul(argv[++a]));
         }
+    }
+
+    // Load ground-truth poses if provided (KITTI format: 12 values per line).
+    std::vector<Eigen::Matrix4d> gt_poses;
+    if (!gt_path.empty()) {
+        std::ifstream f(gt_path);
+        if (!f) throw std::runtime_error("Cannot open GT file: " + gt_path);
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.empty()) continue;
+            std::istringstream ss(line);
+            Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 4; ++c)
+                    ss >> T(r, c);
+            gt_poses.push_back(T);
+        }
+        std::cout << "  GT poses     : " << gt_poses.size() << " frames\n";
     }
 
     try {
@@ -78,9 +104,14 @@ int main(int argc, char** argv) {
         double      total_ms      = 0.0;
         double      total_s_ratio = 0.0;
         std::size_t n_lost        = 0;
+        double      sum_sq_err    = 0.0;  // for ATE RMSE
+        std::size_t n_gt_frames   = 0;
 
         std::vector<Eigen::Matrix4d> trajectory;
         trajectory.reserve(loader.size());
+        // We no longer pre-populate `trajectory` per frame; it is rebuilt
+        // from `tracker.resolved_trajectory()` after the run so that any
+        // BA correction landed during processing is reflected.
 
         for (std::size_t i = 0; i < std::min(loader.size(), max_frames); ++i) {
             const auto raw = loader.load(i);
@@ -120,9 +151,26 @@ int main(int argc, char** argv) {
             if (lost) ++n_lost;
 
             trajectory.push_back(result.frame->T_cw);
+            // Note: this entry is the *raw* per-frame pose at the moment
+            // of capture; the saved trajectory below uses the BA-corrected
+            // resolved poses.
 
             if (viewer)
                 viewer->set_current_pose(result.frame->T_cw);
+
+            // Per-frame translational error against GT (if provided).
+            double t_err = -1.0;
+            if (i < gt_poses.size()) {
+                // Estimate is T_cw; KITTI ground truth is T_wc.
+                const Eigen::Matrix4d& T_est = result.frame->T_cw;
+                const Eigen::Matrix4d& T_gt  = gt_poses[i];
+                const Eigen::Vector3d t_est =
+                    -T_est.block<3,3>(0,0).transpose() * T_est.block<3,1>(0,3);
+                const Eigen::Vector3d t_gt = T_gt.block<3,1>(0,3);
+                t_err = (t_est - t_gt).norm();
+                sum_sq_err += t_err * t_err;
+                ++n_gt_frames;
+            }
 
             std::cout << "frame " << i
                       << (lost ? "  [LOST]" : "  [OK]  ")
@@ -131,7 +179,11 @@ int main(int argc, char** argv) {
                       << "  fm=" << result.n_matches
                       << "  inliers=" << result.n_inliers
                       << "  med_d=" << median_depth << " m"
-                      << "  " << static_cast<int>(ms) << " ms\n";
+                      << "  " << static_cast<int>(ms) << " ms"
+                      << (t_err >= 0.0
+                          ? ("  err=" + std::to_string(t_err).substr(0, 5) + "m")
+                          : "")
+                      << "\n";
 
             // --- Visualisation ------------------------------------------
             if (display) {
@@ -167,17 +219,61 @@ int main(int argc, char** argv) {
             }
         }
 
+        tracker.local_mapping()->wait_until_idle();
+        const auto ba_stats = tracker.local_mapping()->ba_stats();
+
         const std::size_t n_frames_run = std::min(loader.size(), max_frames);
+        std::size_t active_kfs = 0;
+        for (const auto& kf : tracker.map()->get_all_keyframes())
+            if (kf && !kf->is_bad()) ++active_kfs;
+
+        std::size_t active_mps = 0;
+        for (const auto& mp : tracker.map()->get_all_mappoints())
+            if (mp && !mp->is_bad()) ++active_mps;
+
         std::cout << "\nSummary:"
                   << "\n  avg latency  : " << (total_ms / n_frames_run) << " ms/frame"
                   << "\n  avg stereo % : "
                   << static_cast<int>(total_s_ratio / n_frames_run * 100.0) << "%"
                   << "\n  lost frames  : " << n_lost << " / " << n_frames_run
-                  << "\n  keyframes    : " << tracker.map()->keyframe_count()
-                  << "\n  map points   : " << tracker.map()->mappoint_count() << "\n";
+                  << "\n  keyframes    : " << active_kfs << " active / "
+                  << tracker.map()->keyframe_count() << " total"
+                  << "\n  map points   : " << active_mps << " active / "
+                  << tracker.map()->mappoint_count() << " total"
+                  << "\n  local BA     : " << ba_stats.runs << " runs, avg "
+                  << ba_stats.avg_ms() << " ms, max " << ba_stats.max_ms << " ms";
+        if (n_gt_frames > 0)
+            std::cout << "\n  ATE RMSE     : "
+                      << std::sqrt(sum_sq_err / n_gt_frames) << " m  (raw, no alignment)";
+
+        // Recompute ATE on the BA-anchored resolved trajectory.
+        const auto resolved = tracker.resolved_trajectory();
+        if (!gt_poses.empty() && !resolved.empty()) {
+            const std::size_t n =
+                std::min(resolved.size(), gt_poses.size());
+            double sq = 0.0;
+            std::size_t k = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                const Eigen::Matrix4d& T_est = resolved[i];
+                const Eigen::Matrix4d& T_gt  = gt_poses[i];
+                const Eigen::Vector3d t_est =
+                    -T_est.block<3,3>(0,0).transpose() * T_est.block<3,1>(0,3);
+                const Eigen::Vector3d t_gt = T_gt.block<3,1>(0,3);
+                sq += (t_est - t_gt).squaredNorm();
+                ++k;
+            }
+            if (k > 0)
+                std::cout << "\n  ATE (resolved): "
+                          << std::sqrt(sq / k) << " m  (BA-anchored)";
+        }
+        std::cout << "\n";
 
         if (!output_path.empty()) {
-            sslam::save_trajectory_kitti(output_path, trajectory);
+            // Use the BA-anchored trajectory: each frame's pose is
+            // reconstructed against its reference KeyFrame's current pose,
+            // so Local BA corrections propagate into the saved file.
+            const auto resolved = tracker.resolved_trajectory();
+            sslam::save_trajectory_kitti(output_path, resolved);
             std::cout << "  trajectory   : " << output_path << "\n";
         }
 

@@ -54,6 +54,8 @@ add_library(sslam
     src/types/mappoint.cpp
     src/types/keyframe.cpp
     src/types/map.cpp
+    src/mapping/triangulation.cpp
+    src/mapping/local_mapping.cpp
     src/viewer/map_viewer.cpp
 )
 
@@ -70,6 +72,7 @@ target_link_libraries(sslam PUBLIC
     g2o::stuff
     g2o::types_sba
     g2o::solver_dense
+    g2o::solver_eigen
 )
 
 if(spdlog_FOUND)

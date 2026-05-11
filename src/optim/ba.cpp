@@ -1,9 +1,15 @@
-// Motion-only bundle adjustment.
+// Motion-only and local bundle adjustment.
 //
-// Optimises a single camera pose (SE3Expmap vertex) against a fixed set of
-// 3-D world points observed as stereo correspondences (u_l, v, u_r).
+// optimize_pose:
+//   Optimises a single camera pose (SE3Expmap vertex) against a fixed set of
+//   3-D world points observed as stereo correspondences (u_l, v, u_r).
 //
-// The optimiser runs `outer_iterations` Levenberg-Marquardt rounds.  After
+// local_bundle_adjustment:
+//   Jointly optimises a window of KeyFrame poses (SE3Expmap vertices) and
+//   their shared MapPoint positions (PointXYZ vertices).  Fixed-KF poses
+//   anchor the gauge without participating in the update.
+//
+// Both optimisers run `outer_iterations` Levenberg-Marquardt rounds.  After
 // each round every edge is reclassified as inlier/outlier by comparing its
 // chi-squared error to `chi2_threshold`.  Outlier edges have their level set
 // to 1 (excluded from subsequent LM steps) while inlier edges remain at
@@ -17,11 +23,17 @@
 
 #include "sslam/optim/ba.hpp"
 #include "sslam/optim/g2o_types.hpp"
+#include "sslam/types/keyframe.hpp"
+#include "sslam/types/mappoint.hpp"
 
 #include <Eigen/Geometry>
 
+#include <algorithm>
 #include <cassert>
 #include <memory>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace sslam {
 namespace ba {
@@ -139,6 +151,237 @@ PoseOptResult optimize_pose(
     result.T_cw    = from_se3quat(v->estimate());
     result.n_inliers = n_inliers;
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Local Bundle Adjustment
+// ---------------------------------------------------------------------------
+
+void local_bundle_adjustment(KeyFrame* kf,
+                             const StereoCamera& cam,
+                             const Params& p) {
+    // -----------------------------------------------------------------------
+    // 1. Collect local KFs (current KF + covisibility neighbours).
+    // -----------------------------------------------------------------------
+    std::unordered_set<KeyFrame*> local_kf_set;
+    local_kf_set.insert(kf);
+    {
+        auto covis = kf->get_covisibility_keyframes(0);  // sorted by weight desc
+        if (static_cast<int>(covis.size()) > p.max_local_kfs)
+            covis.resize(static_cast<std::size_t>(p.max_local_kfs));
+        for (KeyFrame* nb : covis)
+            if (nb && !nb->is_bad())
+                local_kf_set.insert(nb);
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Collect all MPs observed by local KFs (capped to keep g2o tractable).
+    // -----------------------------------------------------------------------
+    std::unordered_set<MapPoint*> local_mp_set;
+    for (KeyFrame* lkf : local_kf_set)
+        for (const auto& mp : lkf->get_map_points())
+            if (mp && !mp->is_bad())
+                local_mp_set.insert(mp.get());
+
+    // Cap the MP set deterministically so the g2o problem stays bounded.
+    if (static_cast<int>(local_mp_set.size()) > p.max_local_mps) {
+        std::vector<MapPoint*> sorted_mps(local_mp_set.begin(), local_mp_set.end());
+        std::sort(sorted_mps.begin(), sorted_mps.end(),
+                  [](const MapPoint* a, const MapPoint* b) {
+                      return a->id() < b->id();
+                  });
+        std::unordered_set<MapPoint*> trimmed;
+        trimmed.reserve(static_cast<std::size_t>(p.max_local_mps));
+        for (MapPoint* mp : sorted_mps) {
+            trimmed.insert(mp);
+            if (static_cast<int>(trimmed.size()) >= p.max_local_mps) break;
+        }
+        local_mp_set = std::move(trimmed);
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Fixed KFs: observe local MPs but are not local themselves.
+    //    If none exist (map is small), fix the oldest local KF to remove
+    //    gauge freedom.
+    // -----------------------------------------------------------------------
+    std::unordered_set<KeyFrame*> fixed_kf_set;
+    for (MapPoint* mp : local_mp_set) {
+        for (const auto& [obs_kf, feat_idx] : mp->get_observations()) {
+            if (obs_kf && !obs_kf->is_bad() && local_kf_set.count(obs_kf) == 0)
+                fixed_kf_set.insert(obs_kf);
+        }
+    }
+
+    // Anchor: if still no fixed KF, fix the local KF with the smallest id.
+    KeyFrame* anchor_kf = nullptr;
+    if (fixed_kf_set.empty() && local_kf_set.size() > 1) {
+        for (KeyFrame* lkf : local_kf_set) {
+            if (!anchor_kf || lkf->id() < anchor_kf->id())
+                anchor_kf = lkf;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. Build g2o graph.
+    //    Schur-complement (sparse Eigen) solver for KF × MP block structure.
+    // -----------------------------------------------------------------------
+    using BlockSolver  = g2o::BlockSolver_6_3;
+    using LinearSolver = g2o::LinearSolverEigen<BlockSolver::PoseMatrixType>;
+
+    auto optimizer = std::make_unique<g2o::SparseOptimizer>();
+    optimizer->setVerbose(false);
+    auto* algorithm = new g2o::OptimizationAlgorithmLevenberg(
+        std::make_unique<BlockSolver>(std::make_unique<LinearSolver>()));
+    optimizer->setAlgorithm(algorithm);
+
+    // Vertex IDs:
+    //   0 … N_local-1  : local KF poses
+    //   N_local … N_local+N_fixed-1 : fixed KF poses
+    //   N_local+N_fixed … : MP positions
+
+    int next_id = 0;
+    std::unordered_map<KeyFrame*, int>  kf_to_id;
+    std::unordered_map<MapPoint*, int>  mp_to_id;
+
+    // Local KF vertices (free, except the anchor if set)
+    for (KeyFrame* lkf : local_kf_set) {
+        auto* v = new g2o::VertexSE3Expmap();
+        v->setId(next_id);
+        v->setFixed(lkf == anchor_kf);
+        v->setEstimate(to_se3quat(lkf->get_pose()));
+        optimizer->addVertex(v);
+        kf_to_id[lkf] = next_id++;
+    }
+
+    // Fixed KF vertices
+    for (KeyFrame* fkf : fixed_kf_set) {
+        auto* v = new g2o::VertexSE3Expmap();
+        v->setId(next_id);
+        v->setFixed(true);
+        v->setEstimate(to_se3quat(fkf->get_pose()));
+        optimizer->addVertex(v);
+        kf_to_id[fkf] = next_id++;
+    }
+
+    // MP vertices
+    for (MapPoint* mp : local_mp_set) {
+        auto* v = new g2o::VertexPointXYZ();
+        v->setId(next_id);
+        v->setFixed(false);
+        v->setMarginalized(true);  // enables Schur complement
+        const Eigen::Vector3d pos = mp->get_world_pos();
+        v->setEstimate(pos);
+        optimizer->addVertex(v);
+        mp_to_id[mp] = next_id++;
+    }
+
+    // Edges
+    struct EdgeInfo {
+        g2o::EdgeStereoSE3ProjectXYZ* edge;
+        KeyFrame*  kf;
+        MapPoint*  mp;
+        int        feat_idx;
+    };
+    std::vector<EdgeInfo> edge_infos;
+
+    const double bf = cam.fx * cam.baseline;
+
+    for (MapPoint* mp : local_mp_set) {
+        const int mp_id = mp_to_id.at(mp);
+        for (const auto& [obs_kf, feat_idx] : mp->get_observations()) {
+            if (!obs_kf || obs_kf->is_bad()) continue;
+            if (kf_to_id.count(obs_kf) == 0) continue;
+
+            const auto& kps  = obs_kf->keypoints_left();
+            const auto& ru   = obs_kf->right_u();
+            if (feat_idx < 0 ||
+                static_cast<std::size_t>(feat_idx) >= kps.size()) continue;
+            const float right_u = ru[static_cast<std::size_t>(feat_idx)];
+            if (right_u < 0.0f) continue;  // no stereo observation
+
+            auto* e = new g2o::EdgeStereoSE3ProjectXYZ();
+            e->setVertex(0, optimizer->vertex(mp_id));
+            e->setVertex(1, optimizer->vertex(kf_to_id.at(obs_kf)));
+
+            const cv::KeyPoint& kp = kps[static_cast<std::size_t>(feat_idx)];
+            e->setMeasurement(
+                Eigen::Vector3d(kp.pt.x, kp.pt.y, right_u));
+            e->setInformation(Eigen::Matrix3d::Identity());
+
+            auto* rk = new g2o::RobustKernelHuber();
+            rk->setDelta(p.huber_delta);
+            e->setRobustKernel(rk);
+
+            e->fx = cam.fx; e->fy = cam.fy;
+            e->cx = cam.cx; e->cy = cam.cy;
+            e->bf = bf;
+
+            optimizer->addEdge(e);
+            edge_infos.push_back({e, obs_kf, mp, feat_idx});
+        }
+    }
+
+    if (edge_infos.empty()) return;
+
+    // -----------------------------------------------------------------------
+    // 5. Two-pass optimisation with outlier reclassification.
+    // -----------------------------------------------------------------------
+    for (int pass = 0; pass < 2; ++pass) {
+        // Only reset estimates on the first pass; pass 2 starts from pass 1's
+        // result (already stored in the g2o vertices).
+        if (pass == 0) {
+            for (KeyFrame* lkf : local_kf_set)
+                static_cast<g2o::VertexSE3Expmap*>(
+                    optimizer->vertex(kf_to_id.at(lkf)))
+                    ->setEstimate(to_se3quat(lkf->get_pose()));
+        }
+
+        optimizer->initializeOptimization(0);
+        optimizer->optimize(pass == 0 ? p.inner_iterations
+                                      : p.inner_iterations * 2);
+
+        // Reclassify after pass 1 only (pass 2 is the final clean solve).
+        if (pass == 0) {
+            for (auto& ei : edge_infos) {
+                ei.edge->computeError();
+                if (ei.edge->chi2() > p.chi2_threshold) {
+                    ei.edge->setLevel(1);  // exclude from pass 2
+                    ei.edge->setRobustKernel(nullptr);
+                } else {
+                    ei.edge->setLevel(0);
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. Write back optimised poses and point positions, remove outlier obs.
+    // -----------------------------------------------------------------------
+    for (KeyFrame* lkf : local_kf_set) {
+        const auto* v = static_cast<const g2o::VertexSE3Expmap*>(
+            optimizer->vertex(kf_to_id.at(lkf)));
+        lkf->set_pose(from_se3quat(v->estimate()));
+    }
+
+    for (MapPoint* mp : local_mp_set) {
+        const auto* v = static_cast<const g2o::VertexPointXYZ*>(
+            optimizer->vertex(mp_to_id.at(mp)));
+        mp->set_world_pos(v->estimate());
+        mp->update_normal_and_depth();
+    }
+
+    // Remove observations whose final edge is an outlier.
+    for (const auto& ei : edge_infos) {
+        if (ei.edge->level() == 1 || ei.edge->chi2() > p.chi2_threshold) {
+            ei.kf->erase_map_point(ei.feat_idx);
+            ei.mp->remove_observation(ei.kf);
+        }
+    }
+
+    for (KeyFrame* lkf : local_kf_set)
+        lkf->update_connections();
+    for (KeyFrame* fkf : fixed_kf_set)
+        fkf->update_connections();
 }
 
 }  // namespace ba

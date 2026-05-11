@@ -35,6 +35,7 @@ class MapPoint {
     MapPoint(uint64_t id, const Eigen::Vector3d& pos_w, KeyFrame* ref_kf);
 
     uint64_t id() const { return id_; }
+    uint64_t created_kf_id() const { return created_kf_id_; }
 
     // --- World position (guarded by pos_mutex_) --------------------------
 
@@ -75,7 +76,7 @@ class MapPoint {
 
     /// Recompute mean viewing normal and depth range from current observations.
     /// Uses ORBExtractor defaults (scale 1.2, 8 levels).
-    /// TODO(Phase 3): pass ORBExtractor::Params instead of hardcoding.
+    /// TODO: pass ORBExtractor::Params instead of hardcoding.
     void update_normal_and_depth();
 
     /// Mean viewing direction (unit vector).  Zero until first update.
@@ -88,6 +89,7 @@ class MapPoint {
 
    private:
     const uint64_t  id_;
+    uint64_t        created_kf_id_{0};
     KeyFrame*       ref_kf_;   ///< Non-owning reference KF — see CODING_STYLE.md §Memory.
 
     // --- Guarded by pos_mutex_ -------------------------------------------

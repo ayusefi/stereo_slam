@@ -11,6 +11,8 @@
 
 namespace sslam {
 
+class KeyFrame;  // forward-declaration; only a non-owning pointer is held.
+
 /// A single stereo capture as it travels through the tracking pipeline.
 ///
 /// Lifecycle:
@@ -43,6 +45,17 @@ struct Frame {
     /// Pose of the world expressed in the camera frame (SE(3)). Identity
     /// for the very first frame.
     Eigen::Matrix4d T_cw{Eigen::Matrix4d::Identity()};
+
+    // --- Map-anchored pose (set after a KeyFrame exists) -----------------
+    /// Reference KeyFrame at the time this frame was tracked (raw,
+    /// non-owning; KeyFrames are co-owned by Map).  Null for frames
+    /// processed before the first KeyFrame is inserted.
+    KeyFrame*       ref_kf{nullptr};
+    /// Relative pose: T_cw expressed in ref_kf's camera frame, i.e.
+    /// `T_ref = T_cw * inverse(ref_kf->get_pose())` evaluated at tracking
+    /// time.  Lets us re-anchor `T_cw` after Local BA moves `ref_kf`:
+    ///   `T_cw_corrected = T_ref * ref_kf->get_pose()`.
+    Eigen::Matrix4d T_ref{Eigen::Matrix4d::Identity()};
 
     // --- Shared metadata -------------------------------------------------
     std::shared_ptr<const StereoCamera> camera;
