@@ -180,7 +180,7 @@ void local_bundle_adjustment(KeyFrame* kf,
     std::unordered_set<MapPoint*> local_mp_set;
     for (KeyFrame* lkf : local_kf_set)
         for (const auto& mp : lkf->get_map_points())
-            if (mp && !mp->is_bad())
+            if (mp && !mp->is_bad() && mp->n_observations() >= 2)
                 local_mp_set.insert(mp.get());
 
     // Cap the MP set deterministically so the g2o problem stays bounded.
