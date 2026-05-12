@@ -41,3 +41,7 @@ add_executable(test_keyframe_database test_keyframe_database.cpp)
 target_link_libraries(test_keyframe_database PRIVATE sslam GTest::gtest GTest::gtest_main)
 add_test(NAME test_keyframe_database COMMAND test_keyframe_database
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_sim3_solver test_sim3_solver.cpp)
+target_link_libraries(test_sim3_solver PRIVATE sslam GTest::gtest GTest::gtest_main)
+add_test(NAME test_sim3_solver COMMAND test_sim3_solver)
