@@ -13,6 +13,9 @@
 // Usage:  ./kitti_stereo <kitti-sequence-dir> [--no-display] [--output <traj.txt>]
 
 #include "sslam/dataset/kitti_loader.hpp"
+#include "sslam/frontend/orb_vocabulary.hpp"
+#include "sslam/loop/keyframe_database.hpp"
+#include "sslam/loop/loop_closing.hpp"
 #include "sslam/system.hpp"
 #include "sslam/tracking/tracking.hpp"
 #include "sslam/viewer/map_viewer.hpp"
@@ -91,6 +94,34 @@ int main(int argc, char** argv) {
                   << "  baseline : " << cam_ptr->baseline << " m\n";
 
         sslam::Tracking tracker(cam_ptr);
+
+        // --- Loop closing (optional — skipped if vocabulary is absent) -----
+        constexpr const char* kVocabPath = "thirdparty/vocab/ORBvoc.txt";
+        std::unique_ptr<sslam::ORBVocabulary>     vocab;
+        std::unique_ptr<sslam::KeyFrameDatabase>  kf_db;
+        sslam::LoopClosing::Ptr                   loop_closer;
+        {
+            std::ifstream probe(kVocabPath);
+            if (probe.good()) {
+                vocab = std::make_unique<sslam::ORBVocabulary>();
+                std::cout << "Loading ORB vocabulary ... " << std::flush;
+                vocab->load(kVocabPath);
+                std::cout << "done\n";
+                kf_db = std::make_unique<sslam::KeyFrameDatabase>(*vocab);
+                tracker.local_mapping()->set_vocabulary(vocab.get());
+                loop_closer = std::make_shared<sslam::LoopClosing>(
+                    tracker.map(),
+                    tracker.local_mapping(),
+                    vocab.get(),
+                    kf_db.get());
+                tracker.local_mapping()->set_loop_closing(loop_closer.get());
+                loop_closer->start();
+                std::cout << "Loop closing   : enabled\n";
+            } else {
+                std::cout << "Loop closing   : disabled (vocabulary not found at "
+                          << kVocabPath << ")\n";
+            }
+        }
 
         sslam::MapViewer::Ptr viewer;
         if (map_display) {
@@ -220,6 +251,7 @@ int main(int argc, char** argv) {
         }
 
         tracker.local_mapping()->wait_until_idle();
+        if (loop_closer) loop_closer->shutdown();
         const auto ba_stats = tracker.local_mapping()->ba_stats();
 
         const std::size_t n_frames_run = std::min(loader.size(), max_frames);
@@ -241,7 +273,9 @@ int main(int argc, char** argv) {
                   << "\n  map points   : " << active_mps << " active / "
                   << tracker.map()->mappoint_count() << " total"
                   << "\n  local BA     : " << ba_stats.runs << " runs, avg "
-                  << ba_stats.avg_ms() << " ms, max " << ba_stats.max_ms << " ms";
+                  << ba_stats.avg_ms() << " ms, max " << ba_stats.max_ms << " ms"
+                  << "\n  loop closures: "
+                  << (loop_closer ? std::to_string(loop_closer->loop_count()) : "disabled");
         if (n_gt_frames > 0)
             std::cout << "\n  ATE RMSE     : "
                       << std::sqrt(sum_sq_err / n_gt_frames) << " m  (raw, no alignment)";

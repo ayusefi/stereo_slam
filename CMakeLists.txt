@@ -38,7 +38,7 @@ set(G2O_BUILD_SCLAM2D_TYPES        OFF CACHE BOOL "" FORCE)
 set(G2O_BUILD_SLAM3D_TYPES         ON  CACHE BOOL "" FORCE)
 set(G2O_BUILD_SLAM3D_ADDON_TYPES   OFF CACHE BOOL "" FORCE)
 set(G2O_BUILD_ICP_TYPES            OFF CACHE BOOL "" FORCE)
-set(G2O_BUILD_SIM3_TYPES           OFF CACHE BOOL "" FORCE)
+set(G2O_BUILD_SIM3_TYPES           ON  CACHE BOOL "" FORCE)
 set(G2O_BUILD_SBA_TYPES            ON  CACHE BOOL "" FORCE)
 add_subdirectory(thirdparty/g2o EXCLUDE_FROM_ALL)
 
@@ -65,6 +65,10 @@ add_library(sslam
     src/frontend/orb_vocabulary.cpp
     src/loop/keyframe_database.cpp
     src/loop/place_recognizer.cpp
+    src/loop/loop_closing.cpp
+    src/optim/sim3_solver.cpp
+    src/optim/pose_graph.cpp
+    src/optim/full_ba.cpp
 )
 
 target_include_directories(sslam PUBLIC
@@ -79,6 +83,7 @@ target_link_libraries(sslam PUBLIC
     g2o::core
     g2o::stuff
     g2o::types_sba
+    g2o::types_sim3
     g2o::solver_dense
     g2o::solver_eigen
     DBoW2
