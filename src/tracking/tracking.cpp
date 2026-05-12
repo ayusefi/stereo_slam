@@ -25,6 +25,18 @@
 
 namespace sslam {
 
+namespace {
+
+Eigen::Matrix4d inverse_se3(const Eigen::Matrix4d& T_cw) {
+    Eigen::Matrix4d T_wc = Eigen::Matrix4d::Identity();
+    const Eigen::Matrix3d R_wc = T_cw.topLeftCorner<3, 3>().transpose();
+    T_wc.topLeftCorner<3, 3>()  = R_wc;
+    T_wc.topRightCorner<3, 1>() = -R_wc * T_cw.topRightCorner<3, 1>();
+    return T_wc;
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // ConstantVelocityMotionModel
 // ---------------------------------------------------------------------------
@@ -299,14 +311,8 @@ Tracking::FrameResult Tracking::process_frame(std::size_t idx, double ts,
 
 void Tracking::anchor_and_record_(Frame& frame) {
     if (last_kf_ && !last_kf_->is_bad()) {
-        const Eigen::Matrix4d T_kw = last_kf_->get_pose();
-        // SE(3) inverse: T_wk = [R^T | -R^T t]
-        const Eigen::Matrix3d R_T = T_kw.topLeftCorner<3, 3>().transpose();
-        Eigen::Matrix4d T_wk      = Eigen::Matrix4d::Identity();
-        T_wk.topLeftCorner<3, 3>() = R_T;
-        T_wk.topRightCorner<3, 1>() = -R_T * T_kw.topRightCorner<3, 1>();
         frame.ref_kf = last_kf_.get();
-        frame.T_ref  = frame.T_cw * T_wk;
+        frame.T_ref  = frame.T_cw * inverse_se3(last_kf_raw_T_cw_);
         trajectory_entries_.push_back({last_kf_.get(), frame.T_ref, frame.T_cw});
     } else {
         frame.ref_kf = nullptr;
@@ -480,19 +486,16 @@ void Tracking::maybe_insert_keyframe(
     // rest of the map.
     Eigen::Matrix4d T_cw_corrected = curr_frame.T_cw;
     if (last_kf_ && !last_kf_->is_bad()) {
-        const Eigen::Matrix4d T_kw = last_kf_->get_pose();
-        const Eigen::Matrix3d R_T  = T_kw.topLeftCorner<3,3>().transpose();
-        Eigen::Matrix4d T_wk = Eigen::Matrix4d::Identity();
-        T_wk.topLeftCorner<3,3>()  = R_T;
-        T_wk.topRightCorner<3,1>() = -R_T * T_kw.topRightCorner<3,1>();
-        // T_ref_curr = curr_frame.T_cw * T_wk (relative to last_kf_ at PnP time)
-        const Eigen::Matrix4d T_ref_curr = curr_frame.T_cw * T_wk;
-        T_cw_corrected = T_ref_curr * T_kw;
+        const Eigen::Matrix4d T_ref_curr =
+            curr_frame.T_cw * inverse_se3(last_kf_raw_T_cw_);
+        T_cw_corrected = T_ref_curr * last_kf_->get_pose();
     }
 
     // --- Build new KeyFrame -----------------------------------------------
     auto kf = std::make_shared<KeyFrame>(next_kf_id_++, curr_frame, cam_);
     kf->set_pose(T_cw_corrected);
+    if (last_kf_ && !last_kf_->is_bad())
+        kf->set_parent(last_kf_.get());
 
     // --- Propagate MPs from last_kf_ via projection + descriptor matching --
     // For each MP in last_kf_, project into curr_frame using curr_frame.T_cw,
@@ -580,6 +583,7 @@ void Tracking::maybe_insert_keyframe(
     local_mapping_->enqueue_keyframe(kf);
 
     last_kf_           = kf;
+    last_kf_raw_T_cw_  = curr_frame.T_cw;
     last_kf_frame_idx_ = curr_frame.index;
     nframes_since_kf_  = 0;
 }

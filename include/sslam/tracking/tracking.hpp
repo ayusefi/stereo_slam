@@ -129,6 +129,7 @@ class Tracking {
     Map::Ptr          map_;
     LocalMapping::Ptr local_mapping_;
     KeyFrame::Ptr     last_kf_;
+    Eigen::Matrix4d   last_kf_raw_T_cw_{Eigen::Matrix4d::Identity()};
     uint64_t      next_kf_id_{0};
     uint64_t      last_kf_frame_idx_{~uint64_t{0}};
     int           nframes_since_kf_{0};
