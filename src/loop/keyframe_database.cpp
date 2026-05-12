@@ -3,6 +3,7 @@
 #include <DBoW2/BowVector.h>
 
 #include <algorithm>
+#include <iostream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -63,23 +64,40 @@ std::vector<const KeyFrame*> KeyFrameDatabase::query_loop_candidates(
 
     if (word_count.empty()) return {};
 
-    // Step 2: compute covisibility-neighbour BoW scores to set the
-    // relative acceptance threshold.
-    double best_covis_score = min_score;
-    for (const KeyFrame* nb : covis_set) {
+    // Step 2: compute minimum BoW similarity among the top-10 covisible KFs.
+    // This sets a data-adaptive floor: any candidate that looks at least as
+    // similar as the weakest of the 10 nearest neighbours passes the filter.
+    constexpr int kTopCovis = 10;
+    const auto top_covis = q->get_covisibility_keyframes(0);  // sorted by weight desc
+    double min_covis_score = min_score;
+    int covis_counted = 0;
+    for (const KeyFrame* nb : top_covis) {
         if (nb == q || !nb->bow_computed()) continue;
         const double s = vocab_.score(q_bow, nb->bow());
-        if (s > best_covis_score) best_covis_score = s;
+        if (covis_counted == 0 || s < min_covis_score) min_covis_score = s;
+        if (++covis_counted >= kTopCovis) break;
     }
-    const double threshold = 0.7 * best_covis_score;
+    const double threshold = 0.7 * min_covis_score;
 
     // Step 3: score each candidate and apply threshold.
     std::vector<const KeyFrame*> results;
     results.reserve(word_count.size());
+    double best_cand_score = 0.0;
     for (const auto& [kf, _] : word_count) {
         if (!kf->bow_computed()) continue;
         const double s = vocab_.score(q_bow, kf->bow());
         if (s >= threshold) results.push_back(kf);
+        if (s > best_cand_score) best_cand_score = s;
+    }
+
+    // Diagnostic: print when candidates are found in the pre-filter.
+    if (!word_count.empty()) {
+        static int diag_count = 0;
+        if (++diag_count % 20 == 0 || !results.empty())
+            std::cerr << "[DB] candidates=" << word_count.size()
+                      << " threshold=" << threshold
+                      << " best_score=" << best_cand_score
+                      << " passing=" << results.size() << "\n";
     }
 
     return results;

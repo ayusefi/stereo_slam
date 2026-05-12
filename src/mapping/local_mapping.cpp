@@ -1,5 +1,6 @@
 #include "sslam/mapping/local_mapping.hpp"
 
+#include "sslam/loop/loop_closing.hpp"
 #include "sslam/mapping/triangulation.hpp"
 
 #include <algorithm>
@@ -56,9 +57,14 @@ LocalMapping::BaStats LocalMapping::ba_stats() const {
     return ba_stats_;
 }
 
-void LocalMapping::request_stop() { stop_requested_ = true; }
+void LocalMapping::request_stop() { stop_requested_ = true; queue_cv_.notify_all(); }
 void LocalMapping::resume()       { stop_requested_ = false; stopped_ = false; queue_cv_.notify_all(); }
 bool LocalMapping::is_stopped() const { return stopped_; }
+
+void LocalMapping::wait_until_stopped() {
+    std::unique_lock lk(queue_mutex_);
+    idle_cv_.wait(lk, [this] { return stopped_.load() || stop_.load(); });
+}
 
 // ---------------------------------------------------------------------------
 
@@ -69,17 +75,20 @@ void LocalMapping::run() {
         {
             std::unique_lock lk(queue_mutex_);
             queue_cv_.wait(lk, [this] {
-                return stop_ || !queue_.empty();
+                return stop_ || stop_requested_ || !queue_.empty();
             });
             if (stop_ && queue_.empty()) break;
-            kf = std::move(queue_.front());
-            queue_.pop_front();
-            processing_ = true;
+            if (!queue_.empty()) {
+                kf = std::move(queue_.front());
+                queue_.pop_front();
+                processing_ = true;
+            }
         }
 
         // Honour pause requests from loop closing.
         while (stop_requested_ && !stop_) {
             stopped_ = true;
+            idle_cv_.notify_all();  // wake wait_until_stopped() callers
             std::unique_lock lk(queue_mutex_);
             queue_cv_.wait_for(lk, std::chrono::milliseconds(3), [this] {
                 return stop_ || !stop_requested_;
@@ -104,6 +113,10 @@ void LocalMapping::run() {
         // observation counts; then prune now-redundant KeyFrames.
         cull_mappoints(kf.get());
         cull_keyframes(kf.get());
+
+        // Forward the fully-processed KF to LoopClosing (if wired).
+        if (loop_closing_ && kf->bow_computed())
+            loop_closing_->enqueue_keyframe(kf);
 
         mark_processing_done();
     }

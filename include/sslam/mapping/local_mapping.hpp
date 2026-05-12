@@ -16,6 +16,8 @@
 
 namespace sslam {
 
+class LoopClosing;  // forward declaration — avoids circular include
+
 /// Background thread that refines the map after each KeyFrame insertion.
 ///
 /// Pipeline per KeyFrame:
@@ -78,6 +80,10 @@ class LocalMapping {
     /// If not set, BoW computation is skipped.
     void set_vocabulary(const ORBVocabulary* vocab) { vocab_ = vocab; }
 
+    /// Set the LoopClosing consumer (call before start()).
+    /// If set, each fully-processed KF is forwarded after BA completes.
+    void set_loop_closing(LoopClosing* lc) { loop_closing_ = lc; }
+
     /// Snapshot of local BA timing statistics.
     BaStats ba_stats() const;
 
@@ -86,6 +92,9 @@ class LocalMapping {
     void request_stop();
     void resume();
     bool is_stopped() const;
+    /// Block until LocalMapping has entered the paused state.
+    /// Must be called after request_stop().
+    void wait_until_stopped();
 
    private:
     void run();
@@ -100,7 +109,8 @@ class LocalMapping {
     // --- Data members ------------------------------------------------------
     Map::Ptr                              map_;
     std::shared_ptr<const StereoCamera>   cam_;
-    const ORBVocabulary*                  vocab_{nullptr};  // non-owning
+    const ORBVocabulary*                  vocab_{nullptr};        // non-owning
+    LoopClosing*                          loop_closing_{nullptr}; // non-owning
     Params                                params_;
     ba::Params                            ba_params_;
 
