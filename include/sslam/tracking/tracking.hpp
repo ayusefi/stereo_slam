@@ -3,7 +3,9 @@
 #include "sslam/camera/stereo_camera.hpp"
 #include "sslam/frontend/feature_matcher.hpp"
 #include "sslam/frontend/orb_extractor.hpp"
+#include "sslam/frontend/orb_vocabulary.hpp"
 #include "sslam/frontend/stereo_matcher.hpp"
+#include "sslam/loop/keyframe_database.hpp"
 #include "sslam/mapping/local_mapping.hpp"
 #include "sslam/tracking/motion_model.hpp"
 #include "sslam/types/frame.hpp"
@@ -56,6 +58,8 @@ class Tracking {
         float wide_radius_scale{4.0f};
 
         // --- KeyFrame insertion policy -----------------------------------
+        /// Minimum spacing before quality/ratio criteria may insert another KF.
+        int   kf_min_frames_since{3};
         /// Insert a KF after this many frames since the last one.
         int   kf_max_frames_since{8};
         /// Insert a KF if PnP inliers drop below this (degraded tracking).
@@ -107,6 +111,13 @@ class Tracking {
     /// Access the local mapping thread (non-null after construction).
     const LocalMapping::Ptr& local_mapping() const { return local_mapping_; }
 
+    /// Wire the ORB vocabulary so the LOST path can query for relocalization.
+    /// Optional: if not set, no BoW-based relocalization is attempted.
+    void set_vocabulary(const ORBVocabulary* vocab) { vocab_ = vocab; }
+
+    /// Wire the KeyFrameDatabase for relocalization queries.
+    void set_keyframe_database(const KeyFrameDatabase* db) { kf_db_reloc_ = db; }
+
     /// Resolved per-frame trajectory in world frame.
     /// Each entry is reconstructed as `T_ref * ref_kf->get_pose()` so any
     /// Local BA correction applied to the reference KeyFrame is reflected
@@ -129,14 +140,20 @@ class Tracking {
     Map::Ptr          map_;
     LocalMapping::Ptr local_mapping_;
     KeyFrame::Ptr     last_kf_;
-    Eigen::Matrix4d   last_kf_raw_T_cw_{Eigen::Matrix4d::Identity()};
     uint64_t      next_kf_id_{0};
     uint64_t      last_kf_frame_idx_{~uint64_t{0}};
     int           nframes_since_kf_{0};
 
+    // --- Relocalization support (optional; wired by the application) -----
+    const ORBVocabulary*     vocab_{nullptr};       // non-owning
+    const KeyFrameDatabase*  kf_db_reloc_{nullptr}; // non-owning
+
     // Per-frame (ref_kf, T_ref) snapshots for resolved_trajectory().
+    // Hold a shared_ptr so a culled reference KF remains alive for export;
+    // Map::remove_keyframe() may otherwise destroy it while old frames still
+    // need its spanning-tree transform.
     struct TrajectoryEntry {
-        KeyFrame*        ref_kf;        ///< Non-owning; KF lives in Map.
+        KeyFrame::Ptr    ref_kf;        ///< Keeps culled reference KFs alive.
         Eigen::Matrix4d  T_ref;         ///< T_cw in ref_kf's camera frame.
         Eigen::Matrix4d  T_cw_fallback; ///< Used when ref_kf is null.
     };
@@ -154,12 +171,20 @@ class Tracking {
     /// it as private mutator.
     void anchor_and_record_(Frame& frame);
 
+    /// Attempt BoW-based relocalization against the KeyFrameDatabase.
+    /// On success, sets frame.T_cw to the recovered pose and returns true.
+    /// Requires vocab_ and kf_db_reloc_ to be non-null.
+    bool relocalize_(Frame& frame);
+
     /// Project local MapPoints (from last_kf_ and its covisible neighbours)
     /// into `frame` using the predicted pose `T_pred`.  For each projected
     /// MP, search within a fixed pixel radius for the best-matching
     /// unmatched feature (Hamming + Lowe ratio).  On success, appends to
-    /// pts3d / pts2d / obs_stereo and returns true when the total number of
-    /// matches is >= params_.min_local_map_matches.
+    /// pts3d / pts2d / obs_stereo / mp_feat_pairs and returns true when the
+    /// total number of matches is >= params_.min_local_map_matches.
+    ///
+    /// `mp_feat_pairs` receives (feature_index_in_frame, MapPoint::Ptr) for
+    /// every accepted match, in the same order as pts3d/pts2d/obs_stereo.
     ///
     /// When this returns false the caller should fall back to frame-to-frame
     /// matching (e.g. the first few frames before a covisibility graph exists).
@@ -167,7 +192,9 @@ class Tracking {
                           const Eigen::Matrix4d& T_pred,
                           std::vector<cv::Point3f>& pts3d,
                           std::vector<cv::Point2f>& pts2d,
-                          std::vector<Eigen::Vector3d>& obs_stereo);
+                          std::vector<Eigen::Vector3d>& obs_stereo,
+                          std::vector<std::pair<int, MapPoint::Ptr>>& mp_feat_pairs,
+                          std::vector<int>& octaves);
 };
 
 }  // namespace sslam
