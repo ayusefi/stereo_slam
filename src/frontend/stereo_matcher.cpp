@@ -94,9 +94,17 @@ void StereoMatcher::match(Frame& frame,
 
         for (int v = std::max(0, v_min); v <= std::min(H - 1, v_max); ++v) {
             for (int j : row_to_right[v]) {
+                if (std::abs(right_kps[j].octave - oct) > 1) continue;
+
                 // Epipolar constraint: right x must be ≤ left x
                 // (allow 1 px slack for sub-pixel keypoint positions).
                 if (right_kps[j].pt.x > u_l + 1.0f) continue;
+
+                const float disp_approx = u_l - right_kps[j].pt.x;
+                if (disp_approx < params_.min_disparity - 1.0f ||
+                    disp_approx > params_.max_disparity + 1.0f) {
+                    continue;
+                }
 
                 const uint8_t* dr = right_descs.ptr<uint8_t>(j);
                 const int dist    = hamming256(dl, dr);

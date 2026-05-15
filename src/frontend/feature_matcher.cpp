@@ -54,6 +54,12 @@ struct KeypointGrid {
     }
 };
 
+struct ProjectionMatchCandidate {
+    int prev_idx;
+    int curr_idx;
+    int distance;
+};
+
 inline int hamming256(const uint8_t* a, const uint8_t* b) {
     int dist = 0;
     for (int i = 0; i < 32; ++i)
@@ -98,8 +104,8 @@ std::vector<std::pair<int, int>> FeatureMatcher::match_by_projection(
     const Eigen::Matrix3d R_curr    = T_curr_cw.topLeftCorner<3, 3>();
     const Eigen::Vector3d t_curr    = T_curr_cw.topRightCorner<3, 1>();
 
-    std::vector<std::pair<int, int>> matches;
-    matches.reserve(static_cast<std::size_t>(n_prev));
+    std::vector<ProjectionMatchCandidate> candidates_all;
+    candidates_all.reserve(static_cast<std::size_t>(n_prev));
 
     std::vector<int> candidates;
     candidates.reserve(64);
@@ -167,7 +173,26 @@ std::vector<std::pair<int, int>> FeatureMatcher::match_by_projection(
             }
         }
 
-        matches.emplace_back(i, best_j);
+        candidates_all.push_back({i, best_j, best_dist});
+    }
+
+    std::sort(candidates_all.begin(), candidates_all.end(),
+              [](const ProjectionMatchCandidate& a,
+                 const ProjectionMatchCandidate& b) {
+                  return a.distance < b.distance;
+              });
+
+    std::vector<std::pair<int, int>> matches;
+    matches.reserve(candidates_all.size());
+    std::vector<bool> matched_prev(static_cast<std::size_t>(n_prev), false);
+    std::vector<bool> matched_curr(static_cast<std::size_t>(n_curr), false);
+    for (const ProjectionMatchCandidate& c : candidates_all) {
+        if (matched_prev[static_cast<std::size_t>(c.prev_idx)] ||
+            matched_curr[static_cast<std::size_t>(c.curr_idx)])
+            continue;
+        matched_prev[static_cast<std::size_t>(c.prev_idx)] = true;
+        matched_curr[static_cast<std::size_t>(c.curr_idx)] = true;
+        matches.emplace_back(c.prev_idx, c.curr_idx);
     }
 
     return matches;
