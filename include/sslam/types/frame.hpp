@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sslam/camera/stereo_camera.hpp"
+#include "sslam/types/mappoint.hpp"
 
 #include <Eigen/Core>
 #include <opencv2/core.hpp>
@@ -56,6 +57,12 @@ struct Frame {
     /// time.  Lets us re-anchor `T_cw` after Local BA moves `ref_kf`:
     ///   `T_cw_corrected = T_ref * ref_kf->get_pose()`.
     Eigen::Matrix4d T_ref{Eigen::Matrix4d::Identity()};
+
+    // --- Stage-2 local-map MP associations (set by two-stage tracker) ------
+    /// Parallel to keypoints_left.  map_points[i] is the MapPoint matched
+    /// to feature i during Stage 2 TrackLocalMap, or null if no association.
+    /// Only populated when TrackLocalMap succeeds; empty otherwise.
+    std::vector<MapPoint::Ptr> map_points;
 
     // --- Shared metadata -------------------------------------------------
     std::shared_ptr<const StereoCamera> camera;

@@ -1,6 +1,7 @@
 #include "sslam/types/mappoint.hpp"
 
 #include "sslam/types/keyframe.hpp"
+#include "sslam/types/map.hpp"
 
 #include <algorithm>
 #include <climits>
@@ -129,22 +130,29 @@ void MapPoint::update_normal_and_depth() {
     normal.normalize();
 
     // Scale-invariance range from the reference keypoint's octave.
-    // ORBExtractor defaults: scale_factor = 1.2, num_levels = 8.
-    constexpr float kScaleFactor = 1.2f;
-    constexpr int   kNumLevels   = 8;
+    // Use the actual ORB extractor scale pyramid stored in the reference KF;
+    // fall back to the ORB defaults (1.2, 8 levels) if not yet populated.
+    const std::vector<float>& sf = ref_kf_->scale_factors();
 
     const auto ref_it = obs.find(ref_kf_);
     if (ref_it == obs.end()) return;
 
-    const int   octave    = ref_kf_->keypoints_left()[ref_it->second].octave;
-    const float dist_ref  = static_cast<float>(
+    const int   octave   = ref_kf_->keypoints_left()[ref_it->second].octave;
+    const float dist_ref = static_cast<float>(
         (pos - ref_kf_->camera_center()).norm());
 
-    float level_scale = 1.0f;
-    for (int i = 0; i < octave; ++i) level_scale *= kScaleFactor;
+    float d_max;
+    if (!sf.empty() && octave < static_cast<int>(sf.size())) {
+        d_max = dist_ref * sf[static_cast<std::size_t>(octave)];
+    } else {
+        // Fallback: ORB defaults (scale_factor=1.2)
+        float level_scale = 1.0f;
+        for (int i = 0; i < octave; ++i) level_scale *= 1.2f;
+        d_max = dist_ref * level_scale;
+    }
 
-    const float d_max = dist_ref * level_scale;
-    const float d_min = d_max / std::pow(kScaleFactor, kNumLevels - 1);
+    const float top_scale = sf.empty() ? std::pow(1.2f, 7) : sf.back();
+    const float d_min     = d_max / top_scale;
 
     std::scoped_lock lk(pos_mutex_);
     normal_       = normal;
@@ -165,6 +173,74 @@ float MapPoint::min_distance() const {
 float MapPoint::max_distance() const {
     std::scoped_lock lk(pos_mutex_);
     return max_distance_;
+}
+
+// --- Lifecycle -----------------------------------------------------------
+
+void MapPoint::set_bad() {
+    // Atomic flip; bail if some other thread already retired this MP.
+    bool expected = false;
+    if (!bad_.compare_exchange_strong(expected, true,
+                                      std::memory_order_acq_rel)) {
+        return;
+    }
+
+    // Snapshot and clear observations under the MP lock so concurrent
+    // readers see an empty map immediately after the bad flag is set.
+    ObsMap snapshot;
+    {
+        std::scoped_lock lk(obs_mutex_);
+        snapshot = std::move(observations_);
+        observations_.clear();
+    }
+
+    // Erase the back-references from the observing KeyFrames.
+    // Each call takes only that KF's obs_mutex_ — no nesting with our locks.
+    for (const auto& [kf, feat_idx] : snapshot) {
+        if (kf) kf->erase_map_point(feat_idx);
+    }
+
+    // Drop ourselves from the owning map's index so future scans don't see us.
+    if (map_) map_->remove_mappoint(id_);
+}
+
+void MapPoint::replace(const MapPoint::Ptr& other) {
+    if (!other || other.get() == this || other->is_bad()) return;
+
+    // Snapshot own observations and set replaced_with_ atomically under our lock.
+    ObsMap snapshot;
+    {
+        std::scoped_lock lk(obs_mutex_);
+        // Already replaced or being retired by another thread — bail.
+        if (replaced_with_ || bad_.load(std::memory_order_relaxed)) return;
+        replaced_with_ = other.get();
+        snapshot = std::move(observations_);
+        observations_.clear();
+    }
+
+    // Redirect every observation to `other`.
+    for (const auto& [kf, feat_idx] : snapshot) {
+        if (!kf) continue;
+        if (other->get_feat_idx(kf) < 0) {
+            // other doesn't have this KF yet — hand it over.
+            kf->add_map_point(feat_idx, other);
+            other->add_observation(kf, feat_idx);
+        } else {
+            // Conflict: other already covers this KF — just drop the slot.
+            kf->erase_map_point(feat_idx);
+        }
+    }
+
+    other->compute_descriptor();
+
+    // Now retire ourselves. observations_ is already empty so set_bad will
+    // only flip the flag and remove from map — no double-erase.
+    set_bad();
+}
+
+MapPoint* MapPoint::get_replaced() const {
+    std::scoped_lock lk(obs_mutex_);
+    return replaced_with_;
 }
 
 }  // namespace sslam

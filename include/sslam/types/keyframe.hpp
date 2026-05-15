@@ -4,6 +4,8 @@
 #include "sslam/types/frame.hpp"
 #include "sslam/types/mappoint.hpp"
 
+#include <unordered_set>
+
 #include <DBoW2/BowVector.h>
 #include <DBoW2/FeatureVector.h>
 
@@ -18,6 +20,8 @@
 #include <vector>
 
 namespace sslam {
+
+class Map;  // forward declaration
 
 /// A Frame promoted to a permanent, map-resident keyframe.
 ///
@@ -42,13 +46,18 @@ class KeyFrame {
     uint64_t id()        const { return id_; }
     double   timestamp() const { return timestamp_; }
     bool     is_bad()    const { return bad_.load(std::memory_order_relaxed); }
-    void     set_bad()         { bad_.store(true, std::memory_order_relaxed); }
+    void     set_bad();
 
     // --- Pose (guarded by pose_mutex_) ------------------------------------
 
     /// Returns T_cw (world → camera), SE(3) as 4×4.
     Eigen::Matrix4d get_pose() const;
     void            set_pose(const Eigen::Matrix4d& T_cw);
+
+    /// Pose for trajectory export.  If this KF was culled, follow its
+    /// stored spanning-tree transform to the first non-bad parent instead
+    /// of falling back to a raw frame pose.
+    Eigen::Matrix4d get_pose_through_spanning_tree() const;
 
     /// Camera centre in world coordinates: $-R^T t$.
     Eigen::Vector3d camera_center() const;
@@ -62,6 +71,12 @@ class KeyFrame {
     const std::vector<float>&        right_u()          const { return right_u_; }
     const std::vector<float>&        depth()            const { return depth_; }
     std::shared_ptr<const StereoCamera> camera()        const { return camera_; }
+
+    /// ORB scale-factor pyramid (set once after construction by Tracking).
+    /// scale_factors()[0] = 1.0; scale_factors()[i] = scale_factor^i.
+    /// Used by MapPoint::update_normal_and_depth and BA information matrices.
+    void set_scale_factors(const std::vector<float>& sf) { scale_factors_ = sf; }
+    const std::vector<float>& scale_factors() const { return scale_factors_; }
 
     // --- MapPoint observations (guarded by obs_mutex_) -------------------
 
@@ -90,7 +105,16 @@ class KeyFrame {
 
     // --- Spanning tree ----------------------------------------------------
     KeyFrame* parent() const { return parent_; }
-    void      set_parent(KeyFrame* kf) { parent_ = kf; }
+
+    /// Set spanning-tree parent. Updates children_ on both old and new parent.
+    void set_parent(KeyFrame* kf);
+
+    /// Children management (called automatically by set_parent).
+    void add_child(KeyFrame* kf);
+    void remove_child(KeyFrame* kf);
+
+    /// Set owning Map back-pointer. Called by Map::add_keyframe().
+    void set_map(Map* m) { map_ = m; }
 
     // --- Bag-of-Words (guarded by bow_mutex_) ----------------------------
 
@@ -123,18 +147,22 @@ class KeyFrame {
     cv::Mat                   descriptors_left_;
     std::vector<float>        right_u_;
     std::vector<float>        depth_;
+    std::vector<float>        scale_factors_;  ///< ORB pyramid: [1, s, s^2, ...], set by Tracking
 
     // --- Guarded by pose_mutex_ ------------------------------------------
     mutable std::mutex pose_mutex_;
     Eigen::Matrix4d    T_cw_{Eigen::Matrix4d::Identity()};
+    Eigen::Matrix4d    T_bad_to_parent_{Eigen::Matrix4d::Identity()};
 
     // --- Guarded by obs_mutex_ -------------------------------------------
     mutable std::mutex                     obs_mutex_;
     std::unordered_map<int, MapPoint::Ptr> observations_;  ///< feat_idx → MP (shared ownership)
     std::unordered_map<KeyFrame*, int>     covisibility_;  ///< raw non-owning KF* → shared obs count
 
-    // Spanning tree parent (raw non-owning)
-    KeyFrame* parent_{nullptr};
+    // Spanning tree (raw non-owning pointers)
+    KeyFrame*                            parent_{nullptr};
+    std::unordered_set<KeyFrame*>        children_;  ///< guarded by obs_mutex_
+    Map*                                 map_{nullptr};
 
     // --- Guarded by bow_mutex_ -------------------------------------------
     mutable std::mutex   bow_mutex_;

@@ -3,13 +3,27 @@
 namespace sslam {
 
 void Map::add_keyframe(KeyFrame::Ptr kf) {
+    if (!kf) return;
+    kf->set_map(this);
     std::scoped_lock lk(mutex_);
     keyframes_[kf->id()] = std::move(kf);
 }
 
+void Map::remove_keyframe(uint64_t id) {
+    std::scoped_lock lk(mutex_);
+    keyframes_.erase(id);
+}
+
 void Map::add_mappoint(MapPoint::Ptr mp) {
+    if (!mp) return;
+    mp->set_map(this);
     std::scoped_lock lk(mutex_);
     mappoints_[mp->id()] = std::move(mp);
+}
+
+void Map::remove_mappoint(uint64_t id) {
+    std::scoped_lock lk(mutex_);
+    mappoints_.erase(id);
 }
 
 uint64_t Map::allocate_mappoint_id() {

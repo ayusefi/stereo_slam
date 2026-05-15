@@ -12,6 +12,7 @@
 namespace sslam {
 
 class KeyFrame;  // forward-declaration — see keyframe.hpp
+class Map;       // forward-declaration — see map.hpp
 
 /// A persistent 3-D landmark in the map.
 ///
@@ -85,12 +86,38 @@ class MapPoint {
     // --- Lifecycle -------------------------------------------------------
 
     bool is_bad() const { return bad_.load(std::memory_order_relaxed); }
-    void set_bad()      { bad_.store(true,  std::memory_order_relaxed); }
+
+    /// Mark this MapPoint as bad. Erases all observations from the
+    /// observing KeyFrames and removes the MP from the owning Map (if set).
+    /// Idempotent — safe to call from multiple threads.
+    void set_bad();
+
+    /// Redirect all observations of this MapPoint to `other`, then mark
+    /// this MP as bad.  ORB-SLAM2 MapPoint::Replace equivalent.
+    /// `other` must be non-null, non-bad, and different from this.
+    void replace(const MapPoint::Ptr& other);
+
+    /// Return the MP this one was replaced with, or nullptr.
+    MapPoint* get_replaced() const;
+
+    /// Set the owning Map back-pointer. Called by Map::add_mappoint().
+    /// Non-owning; the Map outlives every MP it owns.
+    void set_map(Map* m) { map_ = m; }
+
+    // --- Tracking visibility counters (for MP culling) -------------------
+    /// Increment when the MP is projected into a frame (visible candidate).
+    void inc_visible(int n = 1) { n_visible_.fetch_add(n, std::memory_order_relaxed); }
+    /// Increment when the MP is actually matched in a frame.
+    void inc_found(int n = 1)   { n_found_.fetch_add(n,   std::memory_order_relaxed); }
+    int n_visible() const { return n_visible_.load(std::memory_order_relaxed); }
+    int n_found()   const { return n_found_.load(std::memory_order_relaxed); }
 
    private:
     const uint64_t  id_;
     uint64_t        created_kf_id_{0};
     KeyFrame*       ref_kf_;   ///< Non-owning reference KF — see CODING_STYLE.md §Memory.
+    Map*            map_{nullptr};   ///< Non-owning owner Map (set via set_map).
+    MapPoint*       replaced_with_{nullptr};  ///< Set by replace(); guarded by obs_mutex_.
 
     // --- Guarded by pos_mutex_ -------------------------------------------
     mutable std::mutex pos_mutex_;
@@ -105,6 +132,8 @@ class MapPoint {
     cv::Mat            descriptor_;
 
     std::atomic<bool> bad_{false};
+    std::atomic<int>  n_visible_{1};  ///< Times projected into a tracking frame
+    std::atomic<int>  n_found_{1};    ///< Times actually matched (≥1 at creation)
 };
 
 }  // namespace sslam

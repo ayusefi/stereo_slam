@@ -1,10 +1,24 @@
 #include "sslam/types/keyframe.hpp"
 
+#include "sslam/types/map.hpp"
+
 #include <algorithm>
 #include <utility>
 #include <vector>
 
 namespace sslam {
+
+namespace {
+
+Eigen::Matrix4d inverse_se3(const Eigen::Matrix4d& T_cw) {
+    Eigen::Matrix4d T_wc = Eigen::Matrix4d::Identity();
+    const Eigen::Matrix3d R_wc = T_cw.topLeftCorner<3, 3>().transpose();
+    T_wc.topLeftCorner<3, 3>()  = R_wc;
+    T_wc.topRightCorner<3, 1>() = -R_wc * T_cw.topRightCorner<3, 1>();
+    return T_wc;
+}
+
+}  // namespace
 
 KeyFrame::KeyFrame(uint64_t id, const Frame& f,
                    std::shared_ptr<const StereoCamera> cam)
@@ -29,6 +43,134 @@ Eigen::Matrix4d KeyFrame::get_pose() const {
 void KeyFrame::set_pose(const Eigen::Matrix4d& T_cw) {
     std::scoped_lock lk(pose_mutex_);
     T_cw_ = T_cw;
+}
+
+void KeyFrame::set_bad() {
+    // KF id 0 anchors the map origin — never cull it.
+    if (id_ == 0) return;
+
+    // Double-checked: bail if already bad.
+    bool expected = false;
+    if (!bad_.compare_exchange_strong(expected, true,
+                                      std::memory_order_acq_rel)) {
+        return;
+    }
+
+    // --- Compute and store T_to_parent BEFORE any connection cleanup ------
+    Eigen::Matrix4d T_self;
+    {
+        std::scoped_lock lk(pose_mutex_);
+        T_self = T_cw_;
+    }
+    Eigen::Matrix4d T_to_parent = Eigen::Matrix4d::Identity();
+    if (parent_ && !parent_->is_bad()) {
+        T_to_parent = T_self * inverse_se3(parent_->get_pose());
+    }
+    {
+        std::scoped_lock lk(pose_mutex_);
+        T_bad_to_parent_ = T_to_parent;
+    }
+
+    // --- Snapshot children and covisibility, then clear own records -------
+    std::unordered_set<KeyFrame*> children_copy;
+    std::vector<std::pair<KeyFrame*, int>> cov_copy;  // (kf, weight)
+    {
+        std::scoped_lock lk(obs_mutex_);
+        children_copy = children_;
+        children_.clear();
+        cov_copy.reserve(covisibility_.size());
+        for (const auto& [kf, w] : covisibility_)
+            cov_copy.push_back({kf, w});
+        covisibility_.clear();
+    }
+
+    // --- Re-parent each child --------------------------------------------
+    // Try to give each child the highest-weight non-bad covisible of THIS KF
+    // as its new parent. Fall back to grandparent. If none, leave child
+    // connected to this (bad) KF — chain-walking in get_pose_through_spanning_tree
+    // will still resolve the pose correctly.
+    // Sort covisibles by weight descending so the best candidate is tried first.
+    std::sort(cov_copy.begin(), cov_copy.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    for (KeyFrame* child : children_copy) {
+        if (child->is_bad()) continue;
+        bool found = false;
+        for (const auto& [cov_kf, w] : cov_copy) {
+            if (cov_kf == child || cov_kf->is_bad()) continue;
+            child->set_parent(cov_kf);
+            found = true;
+            break;
+        }
+        if (!found && parent_ && !parent_->is_bad()) {
+            child->set_parent(parent_);
+        }
+        // If still nothing: child keeps its pointer to this bad KF; chain-walk handles it.
+    }
+
+    // --- Remove this KF from each covisible's connection table -----------
+    for (const auto& [cov_kf, w] : cov_copy) {
+        if (!cov_kf) continue;
+        std::scoped_lock lk(cov_kf->obs_mutex_);
+        cov_kf->covisibility_.erase(this);
+    }
+
+    // --- Remove from parent's children list (if any) --------------------
+    if (parent_) {
+        std::scoped_lock lk(parent_->obs_mutex_);
+        parent_->children_.erase(this);
+    }
+
+    // --- Remove from Map -------------------------------------------------
+    if (map_) map_->remove_keyframe(id_);
+}
+
+// --- Spanning tree -------------------------------------------------------
+
+void KeyFrame::set_parent(KeyFrame* new_parent) {
+    KeyFrame* old_parent = parent_;
+    parent_ = new_parent;
+
+    // Remove from old parent's children list.
+    if (old_parent && old_parent != new_parent) {
+        std::scoped_lock lk(old_parent->obs_mutex_);
+        old_parent->children_.erase(this);
+    }
+    // Register as child of new parent.
+    if (new_parent) {
+        std::scoped_lock lk(new_parent->obs_mutex_);
+        new_parent->children_.insert(this);
+    }
+}
+
+void KeyFrame::add_child(KeyFrame* kf) {
+    if (!kf) return;
+    std::scoped_lock lk(obs_mutex_);
+    children_.insert(kf);
+}
+
+void KeyFrame::remove_child(KeyFrame* kf) {
+    if (!kf) return;
+    std::scoped_lock lk(obs_mutex_);
+    children_.erase(kf);
+}
+
+Eigen::Matrix4d KeyFrame::get_pose_through_spanning_tree() const {
+    Eigen::Matrix4d T_acc = Eigen::Matrix4d::Identity();
+    const KeyFrame* kf = this;
+
+    for (int depth = 0; kf && kf->is_bad() && kf->parent_ && depth < 10000; ++depth) {
+        Eigen::Matrix4d T_to_parent;
+        {
+            std::scoped_lock lk(kf->pose_mutex_);
+            T_to_parent = kf->T_bad_to_parent_;
+        }
+        T_acc = T_acc * T_to_parent;
+        kf = kf->parent_;
+    }
+
+    if (!kf) return T_acc;
+    return T_acc * kf->get_pose();
 }
 
 Eigen::Vector3d KeyFrame::camera_center() const {

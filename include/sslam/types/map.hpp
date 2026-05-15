@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -27,6 +28,13 @@ class Map {
     void add_keyframe(KeyFrame::Ptr kf);
     void add_mappoint(MapPoint::Ptr mp);
 
+    /// Remove a KeyFrame from the map by id. Called from KeyFrame::set_bad().
+    void remove_keyframe(uint64_t id);
+
+    /// Remove a MapPoint from the map by id. Called from MapPoint::set_bad();
+    /// also safe to call directly. Idempotent.
+    void remove_mappoint(uint64_t id);
+
     /// Allocate a unique MapPoint id across all map writers.
     uint64_t allocate_mappoint_id();
 
@@ -44,6 +52,11 @@ class Map {
     /// mutex_ protects keyframes_ and mappoints_.
     /// Exposed for callers that need multi-step atomic access.
     mutable std::mutex mutex_;
+
+    /// Serializes large map corrections against live tracking reads.
+    /// Tracking takes a shared lock while processing a frame; LoopClosing takes
+    /// a unique lock while fusing MapPoints and applying pose-graph correction.
+    mutable std::shared_mutex update_mutex_;
 
    private:
     std::unordered_map<uint64_t, KeyFrame::Ptr> keyframes_;
