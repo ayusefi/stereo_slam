@@ -2,6 +2,7 @@
 
 #include "sslam/frontend/orb_vocabulary.hpp"
 #include "sslam/loop/keyframe_database.hpp"
+#include "sslam/loop/loop_diagnostics.hpp"
 #include "sslam/loop/place_recognizer.hpp"
 #include "sslam/mapping/local_mapping.hpp"
 #include "sslam/optim/full_ba.hpp"
@@ -49,6 +50,9 @@ class LoopClosing {
     void start();     ///< Spawn the loop-closing thread.
     void shutdown();  ///< Signal stop and join.
 
+    /// Block until the loop queue is empty and no candidate is being checked.
+    void wait_until_idle();
+
     /// Called from the LocalMapping thread after a KF has been fully
     /// processed (BoW computed, BA done).  Non-blocking.
     void enqueue_keyframe(KeyFrame::Ptr kf);
@@ -58,6 +62,10 @@ class LoopClosing {
 
     /// Number of loop closures successfully executed so far.
     int loop_count() const { return loop_count_.load(); }
+
+    /// Set an optional JSONL logger for loop attempt diagnostics.
+    /// Non-owning; the logger must outlive this LoopClosing instance.
+    void set_loop_logger(LoopLogger* logger) { logger_ = logger; }
 
    private:
     void run();
@@ -74,15 +82,18 @@ class LoopClosing {
 
     std::unique_ptr<PlaceRecognizer> recognizer_;
     FullBA::Ptr                      full_ba_;  ///< background full BA after each correction
+    LoopLogger*                      logger_{nullptr};  ///< optional diagnostics (non-owning)
 
     // Work queue — LocalMapping thread pushes, LoopClosing thread pops.
     std::deque<KeyFrame::Ptr> queue_;
     mutable std::mutex        queue_mutex_;
     std::condition_variable   queue_cv_;
+    std::condition_variable   idle_cv_;
 
     std::atomic<bool> stop_{false};
     std::atomic<bool> processing_{false};
     std::atomic<int>  loop_count_{0};
+    uint64_t          last_loop_kf_id_{0};
     std::thread       thread_;
 };
 

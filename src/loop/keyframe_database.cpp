@@ -49,8 +49,9 @@ std::vector<const KeyFrame*> KeyFrameDatabase::query_loop_candidates(
         covis_set.insert(nb);
     covis_set.insert(q);  // also exclude self
 
-    // Step 1: collect candidates sharing ≥ 1 word with q.
-    // Track per-candidate word-overlap count for fast pre-filtering.
+    // ------------------------------------------------------------------
+    // Step 1: count shared words between q and every non-covisible KF.
+    // ------------------------------------------------------------------
     std::unordered_map<const KeyFrame*, int> word_count;
     {
         std::scoped_lock lk(mutex_);
@@ -61,45 +62,137 @@ std::vector<const KeyFrame*> KeyFrameDatabase::query_loop_candidates(
             }
         }
     }
-
     if (word_count.empty()) return {};
 
-    // Step 2: compute minimum BoW similarity among the top-10 covisible KFs.
-    // This sets a data-adaptive floor: any candidate that looks at least as
-    // similar as the weakest of the 10 nearest neighbours passes the filter.
-    constexpr int kTopCovis = 10;
-    const auto top_covis = q->get_covisibility_keyframes(0);  // sorted by weight desc
-    double min_covis_score = min_score;
-    int covis_counted = 0;
-    for (const KeyFrame* nb : top_covis) {
-        if (nb == q || !nb->bow_computed()) continue;
-        const double s = vocab_.score(q_bow, nb->bow());
-        if (covis_counted == 0 || s < min_covis_score) min_covis_score = s;
-        if (++covis_counted >= kTopCovis) break;
-    }
-    const double threshold = 0.7 * min_covis_score;
+    // ------------------------------------------------------------------
+    // Step 2: maxCommonWords pre-filter (ORB-SLAM2: keep >= 0.8 * max).
+    // ------------------------------------------------------------------
+    int max_common = 0;
+    for (const auto& [kf, cnt] : word_count)
+        if (cnt > max_common) max_common = cnt;
+    const int min_common = static_cast<int>(0.8 * max_common);
 
-    // Step 3: score each candidate and apply threshold.
-    std::vector<const KeyFrame*> results;
-    results.reserve(word_count.size());
-    double best_cand_score = 0.0;
-    for (const auto& [kf, _] : word_count) {
+    // ------------------------------------------------------------------
+    // Step 3: score surviving candidates; apply absolute lower bound.
+    // ------------------------------------------------------------------
+    std::unordered_map<const KeyFrame*, double> scores;
+    scores.reserve(word_count.size());
+    for (const auto& [kf, cnt] : word_count) {
+        if (cnt < min_common) continue;
         if (!kf->bow_computed()) continue;
         const double s = vocab_.score(q_bow, kf->bow());
-        if (s >= threshold) results.push_back(kf);
-        if (s > best_cand_score) best_cand_score = s;
+        if (s >= min_score) scores[kf] = s;
+    }
+    if (scores.empty()) return {};
+
+    // ------------------------------------------------------------------
+    // Step 4: covisibility-group score accumulation (ORB-SLAM2 style).
+    //   group(kf) = {kf} ∪ top-10 covisible KFs of kf that are also candidates
+    //   accum_score(kf) = sum of scores of group members
+    // ------------------------------------------------------------------
+    constexpr int kGroupSize = 10;
+    double best_accum = 0.0;
+    std::unordered_map<const KeyFrame*, double> accum_scores;
+    accum_scores.reserve(scores.size());
+
+    for (const auto& [kf, s] : scores) {
+        double accum = s;
+        int count = 0;
+        for (const KeyFrame* nb :
+             const_cast<KeyFrame*>(kf)->get_covisibility_keyframes(0)) {
+            if (count++ >= kGroupSize) break;
+            auto it = scores.find(nb);
+            if (it != scores.end()) accum += it->second;
+        }
+        accum_scores[kf] = accum;
+        if (accum > best_accum) best_accum = accum;
     }
 
-    // Diagnostic: print when candidates are found in the pre-filter.
-    if (!word_count.empty()) {
-        static int diag_count = 0;
-        if (++diag_count % 20 == 0 || !results.empty())
-            std::cerr << "[DB] candidates=" << word_count.size()
-                      << " threshold=" << threshold
-                      << " best_score=" << best_cand_score
-                      << " passing=" << results.size() << "\n";
+    const double retain_thresh = 0.75 * best_accum;
+
+    // ------------------------------------------------------------------
+    // Step 5: for each qualifying group keep the member with highest
+    //         individual score (avoid duplicates via a visited set).
+    // ------------------------------------------------------------------
+    std::unordered_set<const KeyFrame*> visited;
+    std::vector<const KeyFrame*> results;
+
+    // Sort by accumulated score descending so we pick the best group first.
+    std::vector<std::pair<double, const KeyFrame*>> sorted_accum;
+    sorted_accum.reserve(accum_scores.size());
+    for (const auto& [kf, a] : accum_scores)
+        if (a >= retain_thresh) sorted_accum.push_back({a, kf});
+    std::sort(sorted_accum.begin(), sorted_accum.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    for (const auto& [accum, kf] : sorted_accum) {
+        if (visited.count(kf)) continue;
+
+        // Collect the group members and mark all as visited.
+        const KeyFrame* best_kf = kf;
+        double          best_s  = scores.at(kf);
+        visited.insert(kf);
+
+        int count = 0;
+        for (const KeyFrame* nb :
+             const_cast<KeyFrame*>(kf)->get_covisibility_keyframes(0)) {
+            if (count++ >= kGroupSize) break;
+            if (!scores.count(nb)) continue;
+            visited.insert(nb);
+            if (scores.at(nb) > best_s) {
+                best_s  = scores.at(nb);
+                best_kf = nb;
+            }
+        }
+        results.push_back(best_kf);
     }
 
+    return results;
+}
+
+// ---------------------------------------------------------------------------
+// Relocalization candidate query.
+// ---------------------------------------------------------------------------
+
+std::vector<const KeyFrame*> KeyFrameDatabase::query_relocalization_candidates(
+    const DBoW2::BowVector& q_bow, double min_score) const
+{
+    if (q_bow.empty()) return {};
+
+    // Step 1: count shared words with all KFs (no covisibility exclusion).
+    std::unordered_map<const KeyFrame*, int> word_count;
+    {
+        std::scoped_lock lk(mutex_);
+        for (const auto& [word_id, weight] : q_bow) {
+            for (const KeyFrame* kf : index_[static_cast<std::size_t>(word_id)]) {
+                ++word_count[kf];
+            }
+        }
+    }
+    if (word_count.empty()) return {};
+
+    // Step 2: maxCommonWords pre-filter.
+    int max_common = 0;
+    for (const auto& [kf, cnt] : word_count)
+        if (cnt > max_common) max_common = cnt;
+    const int min_common = static_cast<int>(0.8 * max_common);
+
+    // Step 3: score surviving candidates.
+    std::vector<std::pair<double, const KeyFrame*>> scored;
+    for (const auto& [kf, cnt] : word_count) {
+        if (cnt < min_common || !kf->bow_computed() || kf->is_bad()) continue;
+        const double s = vocab_.score(q_bow, kf->bow());
+        if (s >= min_score) scored.push_back({s, kf});
+    }
+    if (scored.empty()) return {};
+
+    // Return sorted by score descending.
+    std::sort(scored.begin(), scored.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    std::vector<const KeyFrame*> results;
+    results.reserve(scored.size());
+    for (const auto& [s, kf] : scored) results.push_back(kf);
     return results;
 }
 

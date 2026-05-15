@@ -43,6 +43,15 @@ class KeyFrameDatabase {
     std::vector<const KeyFrame*> query_loop_candidates(
         const KeyFrame* q, double min_score = 0.0) const;
 
+    /// Query for relocalization candidates using a raw BoW vector.
+    /// Unlike query_loop_candidates, does NOT skip covisible KFs.
+    ///
+    /// @param bow        BoW vector of the query frame (not a KeyFrame).
+    /// @param min_score  Absolute lower bound on similarity score.
+    /// @return Non-owning pointers to candidate KFs.
+    std::vector<const KeyFrame*> query_relocalization_candidates(
+        const DBoW2::BowVector& bow, double min_score = 0.0) const;
+
    private:
     const ORBVocabulary&                vocab_;
     // One posting list per vocabulary word.
