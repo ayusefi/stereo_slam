@@ -177,6 +177,31 @@ TEST(KeyFrame, CameraCenter) {
     EXPECT_TRUE(kf->camera_center().isApprox(Eigen::Vector3d::Zero()));
 }
 
+TEST(KeyFrame, BadKeyFramePoseFollowsParent) {
+    auto cam = make_camera();
+    auto f0  = make_test_frame(0, 5, cam);
+    auto f1  = make_test_frame(1, 5, cam);
+    auto parent = std::make_shared<sslam::KeyFrame>(0u, f0, cam);
+    auto child  = std::make_shared<sslam::KeyFrame>(1u, f1, cam);
+
+    Eigen::Matrix4d T_parent = Eigen::Matrix4d::Identity();
+    T_parent(0, 3) = -10.0;
+    Eigen::Matrix4d T_child = Eigen::Matrix4d::Identity();
+    T_child(0, 3) = -12.0;
+    parent->set_pose(T_parent);
+    child->set_pose(T_child);
+    child->set_parent(parent.get());
+    child->set_bad();
+
+    Eigen::Matrix4d T_parent_corrected = Eigen::Matrix4d::Identity();
+    T_parent_corrected(0, 3) = -20.0;
+    parent->set_pose(T_parent_corrected);
+
+    Eigen::Matrix4d T_expected = Eigen::Matrix4d::Identity();
+    T_expected(0, 3) = -22.0;
+    EXPECT_TRUE(child->get_pose_through_spanning_tree().isApprox(T_expected, 1e-9));
+}
+
 TEST(KeyFrame, TrackedMapPoints) {
     auto cam = make_camera();
     auto f   = make_test_frame(0, 10, cam);

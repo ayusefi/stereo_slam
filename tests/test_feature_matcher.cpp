@@ -179,3 +179,33 @@ TEST(FeatureMatcher, SkipsKeypointsWithoutDepth) {
     EXPECT_EQ(matches[0].first,  1);
     EXPECT_EQ(matches[0].second, 1);
 }
+
+// --------------------------------------------------------------------------
+// Test 4: projection matching must be one-to-one.  Reusing one current
+// keypoint for many previous 3-D points inflates PnP inlier counts and can
+// make an outlier pose look well constrained.
+// --------------------------------------------------------------------------
+TEST(FeatureMatcher, DoesNotReuseCurrentKeypoint) {
+    auto cam = make_cam();
+    sslam::FeatureMatcher matcher(cam);
+
+    std::vector<cv::Point2f> prev_pts = {
+        {500.0f, 180.0f}, {505.0f, 180.0f}, {510.0f, 180.0f}};
+    std::vector<float> depths = {20.0f, 20.0f, 20.0f};
+
+    cv::Mat shared(1, 32, CV_8U, cv::Scalar(7));
+    std::vector<cv::Mat> prev_descs = {shared.clone(), shared.clone(), shared.clone()};
+
+    std::vector<cv::Point2f> curr_pts = {{505.0f, 180.0f}};
+    std::vector<float> curr_depths = {20.0f};
+    std::vector<cv::Mat> curr_descs = {shared.clone()};
+
+    auto prev = make_frame(cam, prev_pts, depths, prev_descs);
+    auto curr = make_frame(cam, curr_pts, curr_depths, curr_descs);
+
+    const auto matches = matcher.match_by_projection(
+        prev, curr, Eigen::Matrix4d::Identity(), 2.0f);
+
+    ASSERT_EQ(matches.size(), 1u);
+    EXPECT_EQ(matches[0].second, 0);
+}

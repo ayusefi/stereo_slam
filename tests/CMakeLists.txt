@@ -16,6 +16,10 @@ add_executable(test_feature_matcher test_feature_matcher.cpp)
 target_link_libraries(test_feature_matcher PRIVATE sslam GTest::gtest GTest::gtest_main)
 add_test(NAME test_feature_matcher COMMAND test_feature_matcher)
 
+add_executable(test_stereo_matcher test_stereo_matcher.cpp)
+target_link_libraries(test_stereo_matcher PRIVATE sslam GTest::gtest GTest::gtest_main)
+add_test(NAME test_stereo_matcher COMMAND test_stereo_matcher)
+
 add_executable(test_tracking test_tracking.cpp)
 target_link_libraries(test_tracking PRIVATE sslam GTest::gtest GTest::gtest_main)
 add_test(NAME test_tracking COMMAND test_tracking)
@@ -45,3 +49,7 @@ add_test(NAME test_keyframe_database COMMAND test_keyframe_database
 add_executable(test_sim3_solver test_sim3_solver.cpp)
 target_link_libraries(test_sim3_solver PRIVATE sslam GTest::gtest GTest::gtest_main)
 add_test(NAME test_sim3_solver COMMAND test_sim3_solver)
+
+add_executable(test_pose_graph test_pose_graph.cpp)
+target_link_libraries(test_pose_graph PRIVATE sslam GTest::gtest GTest::gtest_main)
+add_test(NAME test_pose_graph COMMAND test_pose_graph)

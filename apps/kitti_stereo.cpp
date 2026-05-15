@@ -16,8 +16,10 @@
 #include "sslam/frontend/orb_vocabulary.hpp"
 #include "sslam/loop/keyframe_database.hpp"
 #include "sslam/loop/loop_closing.hpp"
+#include "sslam/loop/loop_diagnostics.hpp"
 #include "sslam/system.hpp"
 #include "sslam/tracking/tracking.hpp"
+#include "sslam/types/keyframe.hpp"
 #include "sslam/viewer/map_viewer.hpp"
 
 #include <Eigen/Core>
@@ -40,7 +42,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: " << argv[0]
                   << " <kitti-sequence-dir> [--no-display] [--output <traj.txt>]"
-                     " [--max-frames N] [--gt <poses.txt>]\n";
+                     " [--max-frames N] [--gt <poses.txt>] [--loop-log <log.jsonl>]\n";
         return 1;
     }
 
@@ -48,6 +50,7 @@ int main(int argc, char** argv) {
     bool        map_display = true;
     std::string output_path;
     std::string gt_path;
+    std::string loop_log_path;
     std::size_t max_frames  = std::numeric_limits<std::size_t>::max();
     for (int a = 2; a < argc; ++a) {
         const std::string arg = argv[a];
@@ -58,6 +61,8 @@ int main(int argc, char** argv) {
             output_path = argv[++a];
         } else if (arg == "--gt" && a + 1 < argc) {
             gt_path = argv[++a];
+        } else if (arg == "--loop-log" && a + 1 < argc) {
+            loop_log_path = argv[++a];
         } else if (arg == "--max-frames" && a + 1 < argc) {
             max_frames = static_cast<std::size_t>(std::stoul(argv[++a]));
         }
@@ -99,6 +104,7 @@ int main(int argc, char** argv) {
         constexpr const char* kVocabPath = "thirdparty/vocab/ORBvoc.txt";
         std::unique_ptr<sslam::ORBVocabulary>     vocab;
         std::unique_ptr<sslam::KeyFrameDatabase>  kf_db;
+        std::unique_ptr<sslam::LoopLogger>        loop_logger;
         sslam::LoopClosing::Ptr                   loop_closer;
         {
             std::ifstream probe(kVocabPath);
@@ -109,12 +115,21 @@ int main(int argc, char** argv) {
                 std::cout << "done\n";
                 kf_db = std::make_unique<sslam::KeyFrameDatabase>(*vocab);
                 tracker.local_mapping()->set_vocabulary(vocab.get());
+                tracker.local_mapping()->set_keyframe_database(kf_db.get());
+                // Also wire vocab+db to Tracking for relocalization.
+                tracker.set_vocabulary(vocab.get());
+                tracker.set_keyframe_database(kf_db.get());
                 loop_closer = std::make_shared<sslam::LoopClosing>(
                     tracker.map(),
                     tracker.local_mapping(),
                     vocab.get(),
                     kf_db.get());
                 tracker.local_mapping()->set_loop_closing(loop_closer.get());
+                if (!loop_log_path.empty()) {
+                    loop_logger = std::make_unique<sslam::LoopLogger>(loop_log_path);
+                    loop_closer->set_loop_logger(loop_logger.get());
+                    std::cout << "Loop log       : " << loop_log_path << "\n";
+                }
                 loop_closer->start();
                 std::cout << "Loop closing   : enabled\n";
             } else {
@@ -186,8 +201,14 @@ int main(int argc, char** argv) {
             // of capture; the saved trajectory below uses the BA-corrected
             // resolved poses.
 
-            if (viewer)
-                viewer->set_current_pose(result.frame->T_cw);
+            if (viewer) {
+                Eigen::Matrix4d T_view_cw = result.frame->T_cw;
+                if (frame.ref_kf) {
+                    T_view_cw = frame.T_ref *
+                                frame.ref_kf->get_pose_through_spanning_tree();
+                }
+                viewer->set_current_pose(T_view_cw);
+            }
 
             // Per-frame translational error against GT (if provided).
             double t_err = -1.0;
@@ -250,7 +271,14 @@ int main(int argc, char** argv) {
             }
         }
 
+        // End-of-sequence export should include tail keyframes.  Drain mapping
+        // first so every processed KF is forwarded to LoopClosing, then drain
+        // LoopClosing so late sequence loops can still be corrected before the
+        // trajectory is written.  FullBA is not launched from LoopClosing, so
+        // this no longer blocks on a large background global solve.
         tracker.local_mapping()->wait_until_idle();
+        if (loop_closer) loop_closer->wait_until_idle();
+        tracker.local_mapping()->shutdown();
         if (loop_closer) loop_closer->shutdown();
         const auto ba_stats = tracker.local_mapping()->ba_stats();
 
@@ -312,6 +340,8 @@ int main(int argc, char** argv) {
         }
 
         if (viewer) {
+            const auto resolved = tracker.resolved_trajectory();
+            if (!resolved.empty()) viewer->set_current_pose(resolved.back());
             std::cout << "  [viewer] Examine the map. Close the Pangolin window to exit.\n";
             viewer->wait_until_closed();
         }
