@@ -16,7 +16,8 @@
 
 namespace sslam {
 
-class LoopClosing;  // forward declaration — avoids circular include
+class LoopClosing;      // forward declaration — avoids circular include
+class KeyFrameDatabase; // forward declaration
 
 /// Background thread that refines the map after each KeyFrame insertion.
 ///
@@ -84,6 +85,9 @@ class LocalMapping {
     /// If set, each fully-processed KF is forwarded after BA completes.
     void set_loop_closing(LoopClosing* lc) { loop_closing_ = lc; }
 
+    /// Set the KeyFrameDatabase so culled KFs are erased from it.
+    void set_keyframe_database(KeyFrameDatabase* db) { kf_db_ = db; }
+
     /// Snapshot of local BA timing statistics.
     BaStats ba_stats() const;
 
@@ -111,6 +115,7 @@ class LocalMapping {
     std::shared_ptr<const StereoCamera>   cam_;
     const ORBVocabulary*                  vocab_{nullptr};        // non-owning
     LoopClosing*                          loop_closing_{nullptr}; // non-owning
+    KeyFrameDatabase*                     kf_db_{nullptr};        // non-owning
     Params                                params_;
     ba::Params                            ba_params_;
 

@@ -1,7 +1,10 @@
 #include "sslam/mapping/local_mapping.hpp"
 
+#include "sslam/loop/keyframe_database.hpp"
 #include "sslam/loop/loop_closing.hpp"
 #include "sslam/mapping/triangulation.hpp"
+
+#include <Eigen/LU>
 
 #include <algorithm>
 #include <chrono>
@@ -168,27 +171,69 @@ void LocalMapping::triangulate_new_mappoints(KeyFrame* kf) {
         const std::vector<cv::KeyPoint>& kps2 = nb->keypoints_left();
         const cv::Mat& descs2 = nb->descriptors_left();
 
+        // Epipolar geometry for triangulation matching.
+        // Fundamental matrix F = K^{-T} * t_x * R * K^{-1}
+        // where [R|t] = T_cw2 * T_cw1^{-1} = relative pose nb←kf.
+        const Eigen::Matrix3d R_cw1 = T_cw.block<3,3>(0,0);
+        const Eigen::Vector3d t_cw1 = T_cw.block<3,1>(0,3);
+        const Eigen::Matrix3d R_cw2 = T_cw2.block<3,3>(0,0);
+        const Eigen::Vector3d t_cw2 = T_cw2.block<3,1>(0,3);
+        // T_21 = T_cw2 * T_cw1^{-1}
+        const Eigen::Matrix3d R_21 = R_cw2 * R_cw1.transpose();
+        const Eigen::Vector3d t_21 = t_cw2 - R_21 * t_cw1;
+        // Skew-symmetric [t]_x
+        Eigen::Matrix3d tx;
+        tx <<   0,     -t_21.z(),  t_21.y(),
+             t_21.z(),  0,        -t_21.x(),
+            -t_21.y(),  t_21.x(),  0;
+        const Eigen::Matrix3d K_inv = K.inverse();
+        const Eigen::Matrix3d F = K_inv.transpose() * tx * R_21 * K_inv;
+        constexpr double kEpipolarTh2 = 3.84;  // chi2, 1 dof, 95%
+
         for (int i = 0; i < static_cast<int>(kps1.size()); ++i) {
             // Skip if kf already has a valid MP at this feature.
             if (kf->get_map_point(i) && !kf->get_map_point(i)->is_bad())
                 continue;
 
-            // Descriptor matching against nb (tighter than TH_HIGH to avoid
-            // wrong associations that would cause BA to diverge).
+            const cv::KeyPoint& kp1 = kps1[i];
+
+            // Descriptor matching against nb with epipolar + octave checks.
             const cv::Mat d1 = kf->descriptors_left().row(i);
-            int best_dist = 50, second_dist = 50, best_j = -1;
+            constexpr int kTHigh = 100;
+            int best_dist = kTHigh + 1, second_dist = kTHigh + 1, best_j = -1;
             for (int j = 0; j < static_cast<int>(kps2.size()); ++j) {
-                const int d = cv::norm(d1, descs2.row(j), cv::NORM_HAMMING);
-                if (d < best_dist) {
+                const cv::KeyPoint& kp2 = kps2[j];
+                // Octave consistency: allow at most ±1 octave.
+                if (std::abs(kp1.octave - kp2.octave) > 1) continue;
+                // Epipolar constraint: point x2 must lie near line F*x1.
+                const Eigen::Vector3d x1h(kp1.pt.x, kp1.pt.y, 1.0);
+                const Eigen::Vector3d l2 = F * x1h;  // epipolar line in view 2
+                // Symmetric epipolar distance²: (l·x2)² / (l0²+l1²)
+                const Eigen::Vector3d x2h(kp2.pt.x, kp2.pt.y, 1.0);
+                const double num = l2.dot(x2h);
+                const double denom = l2.x() * l2.x() + l2.y() * l2.y();
+                if (denom < 1e-10) continue;
+                const double epi_dist2 = (num * num) / denom;
+                // Scale threshold by octave sigma2.
+                const auto& sf1 = kf->scale_factors();
+                const auto& sf2 = nb->scale_factors();
+                const double sigma2_1 = (sf1.empty() || kp1.octave >= static_cast<int>(sf1.size()))
+                    ? std::pow(1.44, kp1.octave) : static_cast<double>(sf1[kp1.octave]) * sf1[kp1.octave];
+                const double sigma2_2 = (sf2.empty() || kp2.octave >= static_cast<int>(sf2.size()))
+                    ? std::pow(1.44, kp2.octave) : static_cast<double>(sf2[kp2.octave]) * sf2[kp2.octave];
+                if (epi_dist2 > kEpipolarTh2 * (sigma2_1 + sigma2_2)) continue;
+                const int dist = cv::norm(d1, descs2.row(j), cv::NORM_HAMMING);
+                if (dist < best_dist) {
                     second_dist = best_dist;
-                    best_dist   = d;
+                    best_dist   = dist;
                     best_j      = j;
-                } else if (d < second_dist) {
-                    second_dist = d;
+                } else if (dist < second_dist) {
+                    second_dist = dist;
                 }
             }
-            // Require Lowe ratio: best must be clearly better than second.
-            if (best_j < 0 || (second_dist < 50 && best_dist > second_dist * 0.75f))
+            // Require best below threshold and Lowe ratio.
+            if (best_j < 0 || best_dist > kTHigh) continue;
+            if (second_dist <= kTHigh && best_dist > static_cast<int>(0.75f * second_dist))
                 continue;
 
             // Skip if nb already has a valid MP at this feature.
@@ -260,7 +305,15 @@ void LocalMapping::cull_mappoints(KeyFrame* current_kf) {
                                    static_cast<uint64_t>(params_.mappoint_grace_kfs)) {
             continue;
         }
-        if (mp->n_observations() < params_.min_mappoint_observations)
+        // Cull if too few KF observations.
+        if (mp->n_observations() < params_.min_mappoint_observations) {
+            mp->set_bad();
+            continue;
+        }
+        // Cull if found/visible ratio is too low (MP is hard to track).
+        const int nvis = mp->n_visible();
+        const int nfnd = mp->n_found();
+        if (nvis > 0 && static_cast<float>(nfnd) / static_cast<float>(nvis) < 0.25f)
             mp->set_bad();
     }
 }
@@ -291,18 +344,30 @@ void LocalMapping::cull_keyframes(KeyFrame* kf) {
         int n_redundant = 0;
         for (const auto& mp : mps) {
             if (!mp || mp->is_bad()) continue;
-            // Count observations from KFs other than ck.
+            // Get the octave at which ck observes this MP.
+            const int ck_feat = mp->get_feat_idx(ck);
+            if (ck_feat < 0) continue;
+            const auto& ck_kps = ck->keypoints_left();
+            if (static_cast<std::size_t>(ck_feat) >= ck_kps.size()) continue;
+            const int ck_octave = ck_kps[static_cast<std::size_t>(ck_feat)].octave;
+            // Count observations from KFs other than ck at same-or-finer scale.
             int n_other = 0;
             for (const auto& [obs_kf, fidx] : mp->get_observations()) {
-                if (obs_kf != ck && !obs_kf->is_bad()) ++n_other;
+                if (obs_kf == ck || obs_kf->is_bad()) continue;
+                const auto& obs_kps = obs_kf->keypoints_left();
+                if (fidx < 0 || static_cast<std::size_t>(fidx) >= obs_kps.size()) continue;
+                if (obs_kps[static_cast<std::size_t>(fidx)].octave <= ck_octave + 1)
+                    ++n_other;
             }
             if (n_other >= 3) ++n_redundant;
         }
 
         const double redundancy =
             static_cast<double>(n_redundant) / static_cast<double>(mps.size());
-        if (redundancy >= 0.9)
+        if (redundancy >= 0.9) {
+            if (kf_db_) kf_db_->erase(ck);
             ck->set_bad();
+        }
     }
 }
 
