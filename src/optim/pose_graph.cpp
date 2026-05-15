@@ -8,9 +8,13 @@
 
 #include <Eigen/Geometry>
 #include <Eigen/LU>
+#include <numeric>
 
 #include <algorithm>
+#include <cmath>
+#include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace sslam {
@@ -34,18 +38,21 @@ Eigen::Matrix4d sim3_to_se3(const g2o::Sim3& s) {
     return T;
 }
 
-}  // namespace
+Eigen::Vector3d camera_center(const Eigen::Matrix4d& T_cw) {
+    return -T_cw.topLeftCorner<3, 3>().transpose() *
+            T_cw.topRightCorner<3, 1>();
+}
 
-// ---------------------------------------------------------------------------
+CorrectionStats optimize_impl(Map& map,
+                              KeyFrame* query_kf,
+                              KeyFrame* match_kf,
+                              double s_qm,
+                              const Eigen::Matrix3d& R_qm,
+                              const Eigen::Vector3d& t_qm,
+                              int n_iters,
+                              bool write_back) {
+    CorrectionStats stats;
 
-void optimize(Map& map,
-              KeyFrame* query_kf,
-              KeyFrame* match_kf,
-              double s_qm,
-              const Eigen::Matrix3d& R_qm,
-              const Eigen::Vector3d& t_qm,
-              int n_iters)
-{
     using BlockSolverType  = g2o::BlockSolverX;
     using LinearSolverType = g2o::LinearSolverDense<BlockSolverType::PoseMatrixType>;
 
@@ -59,7 +66,6 @@ void optimize(Map& map,
 
     const std::vector<KeyFrame::Ptr> all_kfs = map.get_all_keyframes();
 
-    // Pass 1: save old poses for MP correction after optimisation.
     std::unordered_map<KeyFrame*, Eigen::Matrix4d> old_T_cw;
     std::unordered_map<uint64_t, KeyFrame*> kf_by_id;
     old_T_cw.reserve(all_kfs.size());
@@ -69,8 +75,8 @@ void optimize(Map& map,
             kf_by_id[kf->id()] = kf.get();
         }
     }
+    if (!old_T_cw.count(query_kf) || !old_T_cw.count(match_kf)) return stats;
 
-    // --- Build vertices -------------------------------------------------------
     std::unordered_map<KeyFrame*, g2o::VertexSim3Expmap*> v_map;
     for (const KeyFrame::Ptr& kf : all_kfs) {
         if (kf->is_bad()) continue;
@@ -82,13 +88,9 @@ void optimize(Map& map,
         opt.addVertex(v);
         v_map[kf.get()] = v;
     }
-    // Stereo SLAM: metric scale is fixed by the baseline — all vertices hold
-    // unit scale throughout the optimisation.
 
-    // --- Edges ----------------------------------------------------------------
-    // g2o EdgeSim3 error = C * v0 * v1^{-1}, so for zero residual at the
-    // current estimates we need C = v1 * v0^{-1}  (i.e. S_vertex1 * S_vertex0^{-1}).
     int edge_id = static_cast<int>(all_kfs.size()) + 1000;
+    std::vector<std::pair<KeyFrame*, KeyFrame*>> edge_endpoints;
     auto add_edge = [&](KeyFrame* ka, KeyFrame* kb, const g2o::Sim3& meas) {
         if (!v_map.count(ka) || !v_map.count(kb)) return;
         auto* e = new g2o::EdgeSim3();
@@ -98,74 +100,136 @@ void optimize(Map& map,
         e->setMeasurement(meas);
         e->setInformation(Eigen::Matrix<double, 7, 7>::Identity());
         opt.addEdge(e);
+        edge_endpoints.emplace_back(ka, kb);
     };
 
     for (const KeyFrame::Ptr& kf : all_kfs) {
         if (kf->is_bad()) continue;
+        // Spanning-tree edge: kf → parent
         if (kf->parent() && !kf->parent()->is_bad()) {
-            // C = S_parent * S_kf^{-1}  (vertex0=kf, vertex1=parent)
-            const g2o::Sim3 s_pk = se3_to_sim3(kf->parent()->get_pose())
-                                  * se3_to_sim3(kf->get_pose()).inverse();
+            if (!old_T_cw.count(kf->parent())) continue; // shouldn't happen
+            const g2o::Sim3 s_pk = se3_to_sim3(old_T_cw.at(kf->parent()))
+                                  * se3_to_sim3(old_T_cw.at(kf.get())).inverse();
             add_edge(kf.get(), kf->parent(), s_pk);
         }
+        // Covisibility edges (weight >= kMinCovisWeight only — essential graph)
         for (KeyFrame* cov : kf->get_covisibility_keyframes(kMinCovisWeight)) {
             if (cov->id() >= kf->id() || cov->is_bad()) continue;
-            // C = S_cov * S_kf^{-1}  (vertex0=kf, vertex1=cov)
-            const g2o::Sim3 s_ck = se3_to_sim3(cov->get_pose())
-                                  * se3_to_sim3(kf->get_pose()).inverse();
+            if (!old_T_cw.count(cov)) continue;
+            const g2o::Sim3 s_ck = se3_to_sim3(old_T_cw.at(cov))
+                                  * se3_to_sim3(old_T_cw.at(kf.get())).inverse();
             add_edge(kf.get(), cov, s_ck);
         }
     }
 
-    // Defensive odometry-chain edges.  The parent spanning tree is the primary
-    // essential-graph backbone, but older maps or culled-parent gaps can leave
-    // it incomplete.  Consecutive active KFs keep the graph connected enough for
-    // a loop edge to distribute correction instead of moving one component.
-    std::vector<KeyFrame*> ordered_kfs;
-    ordered_kfs.reserve(all_kfs.size());
-    for (const KeyFrame::Ptr& kf : all_kfs)
-        if (kf && !kf->is_bad()) ordered_kfs.push_back(kf.get());
-    std::sort(ordered_kfs.begin(), ordered_kfs.end(),
-              [](const KeyFrame* a, const KeyFrame* b) { return a->id() < b->id(); });
-    for (std::size_t i = 1; i < ordered_kfs.size(); ++i) {
-        KeyFrame* prev = ordered_kfs[i - 1];
-        KeyFrame* curr = ordered_kfs[i];
-        const g2o::Sim3 s_pc = se3_to_sim3(prev->get_pose())
-                              * se3_to_sim3(curr->get_pose()).inverse();
-        add_edge(curr, prev, s_pc);
-    }
-
-    // Loop-closure edge.
-    // The world-frame Sim3 {s_qm, R_qm, t_qm} maps query-world → match-world:
-    //   X_m_world ≈ s_qm * R_qm * X_q_world + t_qm
-    // Corrected query camera pose (in match-world frame):
-    //   S_q_corr = se3_to_sim3(T_cw_query) * S_w^{-1}
-    // Measurement for edge (v0=match, v1=query) = S_q_corr * S_match^{-1}
+    // Loop-closure constraint edge (uses pre-PGO poses via old_T_cw).
     {
         const g2o::Sim3 S_w(Eigen::Quaterniond(R_qm).normalized(), t_qm, s_qm);
-        const g2o::Sim3 S_q_old = se3_to_sim3(query_kf->get_pose());
-        const g2o::Sim3 S_m     = se3_to_sim3(match_kf->get_pose());
+        const g2o::Sim3 S_q_old = se3_to_sim3(old_T_cw.at(query_kf));
+        const g2o::Sim3 S_m     = se3_to_sim3(old_T_cw.at(match_kf));
         const g2o::Sim3 S_q_corr = S_q_old * S_w.inverse();
-        // Pre-set query vertex to corrected estimate so the PGO starts near
-        // the correct answer (mirrors ORB-SLAM2's CorrectLoop() approach).
         if (v_map.count(query_kf))
             v_map.at(query_kf)->setEstimate(S_q_corr);
         add_edge(match_kf, query_kf, S_q_corr * S_m.inverse());
     }
 
-    // --- Optimise -------------------------------------------------------------
+    // --- Connectivity check via union-find --------------------------------
+    // Build adjacency from collected edge endpoints over the vertex set.
+    {
+        std::unordered_map<KeyFrame*, KeyFrame*> uf_parent;
+        uf_parent.reserve(v_map.size());
+        for (const auto& [kf, v] : v_map) uf_parent[kf] = kf;
+
+        std::function<KeyFrame*(KeyFrame*)> uf_find = [&](KeyFrame* x) -> KeyFrame* {
+            while (uf_parent.at(x) != x) {
+                uf_parent[x] = uf_parent.at(uf_parent.at(x));  // path compression
+                x = uf_parent.at(x);
+            }
+            return x;
+        };
+
+        for (const auto& [a, b] : edge_endpoints) {
+            if (!uf_parent.count(a) || !uf_parent.count(b)) continue;
+            KeyFrame* ra = uf_find(a);
+            KeyFrame* rb = uf_find(b);
+            if (ra != rb) uf_parent[ra] = rb;
+        }
+
+        std::unordered_set<KeyFrame*> roots;
+        for (auto& [kf, _parent] : uf_parent) roots.insert(uf_find(kf));
+        stats.graph_components = static_cast<int>(roots.size());
+        stats.graph_vertices   = static_cast<int>(v_map.size());
+        stats.graph_edges      = static_cast<int>(edge_endpoints.size());
+
+        // Only reject if the loop endpoints themselves are in different
+        // components — orphan KFs elsewhere in the map (e.g. from KF-culling
+        // re-parenting failures) are tolerated; their poses simply remain
+        // unchanged by PGO.  ORB-SLAM2 makes no global-connectivity demand.
+        if (uf_parent.count(query_kf) && uf_parent.count(match_kf)) {
+            KeyFrame* rq = uf_find(query_kf);
+            KeyFrame* rm = uf_find(match_kf);
+            if (rq != rm) {
+                std::cerr << "[PGO] reject: loop endpoints in different components ("
+                          << stats.graph_components << " components total, "
+                          << stats.graph_vertices << " vertices, "
+                          << stats.graph_edges << " edges)\n";
+                return stats;  // stats.valid remains false
+            }
+        }
+    }
+
     opt.initializeOptimization();
     opt.optimize(n_iters);
 
-    // --- Write back KF poses --------------------------------------------------
+    stats.valid = true;
+    struct CenterById {
+        uint64_t id;
+        Eigen::Vector3d center;
+    };
+    std::vector<CenterById> centers;
+    centers.reserve(old_T_cw.size());
+    for (const auto& [kf, old_pose] : old_T_cw) {
+        if (!v_map.count(kf)) continue;
+        const Eigen::Matrix4d new_pose = sim3_to_se3(v_map.at(kf)->estimate());
+        const Eigen::Vector3d new_center = camera_center(new_pose);
+        centers.push_back({kf->id(), new_center});
+        const double correction =
+            (new_center - camera_center(old_pose)).norm();
+        if (correction > stats.max_center_correction_m) {
+            stats.max_center_correction_m = correction;
+            stats.max_center_kf_id = kf->id();
+        }
+        if (kf == query_kf) stats.query_center_correction_m = correction;
+        if (kf == match_kf) stats.match_center_correction_m = correction;
+
+        // Rotation correction angle.
+        const Eigen::Matrix3d R_corr =
+            new_pose.topLeftCorner<3, 3>() *
+            old_pose.topLeftCorner<3, 3>().transpose();
+        const double angle_deg =
+            Eigen::AngleAxisd(R_corr).angle() * (180.0 / M_PI);
+        if (angle_deg > stats.max_rotation_correction_deg)
+            stats.max_rotation_correction_deg = angle_deg;
+    }
+    std::sort(centers.begin(), centers.end(),
+              [](const CenterById& a, const CenterById& b) {
+                  return a.id < b.id;
+              });
+    for (std::size_t i = 1; i < centers.size(); ++i) {
+        const double step = (centers[i].center - centers[i - 1].center).norm();
+        if (step > stats.max_adjacent_step_m) {
+            stats.max_adjacent_step_m = step;
+            stats.max_adjacent_step_kf_id = centers[i - 1].id;
+        }
+    }
+
+    if (!write_back) return stats;
+
     for (const KeyFrame::Ptr& kf : all_kfs) {
         if (kf->is_bad() || !v_map.count(kf.get())) continue;
         kf->set_pose(sim3_to_se3(v_map.at(kf.get())->estimate()));
     }
 
-    // --- Move MapPoints with their reference KF correction -------------------
-    // X_new = T_wk_new * T_wk_old^{-1} * X_old
-    //       = T_cw_new^{-1} * T_cw_old * X_old
     const std::vector<MapPoint::Ptr> all_mps = map.get_all_mappoints();
     for (const MapPoint::Ptr& mp : all_mps) {
         if (mp->is_bad()) continue;
@@ -176,30 +240,53 @@ void optimize(Map& map,
             ref = kf_by_id.at(mp->created_kf_id());
         } else {
             for (const auto& [obs_kf, feat_idx] : obs) {
+                (void)feat_idx;
                 if (!obs_kf || !old_T_cw.count(obs_kf)) continue;
                 if (!ref || obs_kf->id() < ref->id()) ref = obs_kf;
             }
         }
-        if (!ref) continue;
-        if (!old_T_cw.count(ref)) continue;
+        if (!ref || !old_T_cw.count(ref)) continue;
 
         const Eigen::Matrix4d& T_old = old_T_cw.at(ref);
-        const Eigen::Matrix4d  T_new = ref->get_pose();  // already updated above
-
-        // T_wk_new = T_new^{-1}, T_wk_old = T_old^{-1}
-        // correction = T_wk_new * T_wk_old^{-1} = T_new^{-1} * T_old
-        const Eigen::Matrix4d T_wk_new =
-            Eigen::Matrix4d(T_new).inverse();  // 4×4 inversion
+        const Eigen::Matrix4d  T_new = ref->get_pose();
+        const Eigen::Matrix4d T_wk_new = Eigen::Matrix4d(T_new).inverse();
         const Eigen::Vector3d X_old = mp->get_world_pos();
-        // X_local = T_cw_old * X_old (in camera frame of ref)
         const Eigen::Vector3d X_local =
             T_old.topLeftCorner<3, 3>() * X_old + T_old.topRightCorner<3, 1>();
-        // X_new = T_wk_new * X_local
         const Eigen::Vector3d X_new =
             T_wk_new.topLeftCorner<3, 3>() * X_local
             + T_wk_new.topRightCorner<3, 1>();
         mp->set_world_pos(X_new);
     }
+
+    return stats;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+
+void optimize(Map& map,
+              KeyFrame* query_kf,
+              KeyFrame* match_kf,
+              double s_qm,
+              const Eigen::Matrix3d& R_qm,
+              const Eigen::Vector3d& t_qm,
+              int n_iters)
+{
+    (void)optimize_impl(map, query_kf, match_kf, s_qm, R_qm, t_qm,
+                        n_iters, true);
+}
+
+CorrectionStats preview(Map& map,
+                        KeyFrame* query_kf,
+                        KeyFrame* match_kf,
+                        double s_qm,
+                        const Eigen::Matrix3d& R_qm,
+                        const Eigen::Vector3d& t_qm,
+                        int n_iters) {
+    return optimize_impl(map, query_kf, match_kf, s_qm, R_qm, t_qm,
+                         n_iters, false);
 }
 
 }  // namespace pose_graph

@@ -8,6 +8,26 @@
 namespace sslam {
 namespace pose_graph {
 
+struct CorrectionStats {
+    bool     valid{false};
+
+    // Translation-based correction metrics.
+    double   max_center_correction_m{0.0};
+    uint64_t max_center_kf_id{0};
+    double   max_adjacent_step_m{0.0};
+    uint64_t max_adjacent_step_kf_id{0};
+    double   query_center_correction_m{0.0};
+    double   match_center_correction_m{0.0};
+
+    // Rotation-based correction metric.
+    double   max_rotation_correction_deg{0.0};
+
+    // Pose-graph topology.
+    int      graph_vertices{0};
+    int      graph_edges{0};
+    int      graph_components{1};  ///< 1 = connected (healthy)
+};
+
 /// Essential-graph Sim3 pose-graph optimisation.
 ///
 /// Vertices: one VertexSim3Expmap per non-bad KeyFrame (scale fixed = 1
@@ -23,9 +43,8 @@ namespace pose_graph {
 /// @param map        The map to optimise in-place.
 /// @param query_kf   The query KeyFrame on the loop.
 /// @param match_kf   The matched KeyFrame on the loop.
-/// @param S_qm       Sim3 that maps match-side into query-side world frame
-///                   (from Sim3Solver): p_q = s*R*p_m + t.
-///                   The edge measurement is S_mq = S_qm^{-1}.
+/// @param S_qm       Sim3 from Sim3Solver that maps query-side world points
+///                   into match-side world points: p_m = s*R*p_q + t.
 /// @param n_iters    LM iterations (default 20).
 void optimize(Map& map,
               KeyFrame* query_kf,
@@ -34,6 +53,17 @@ void optimize(Map& map,
               const Eigen::Matrix3d& R_qm,
               const Eigen::Vector3d& t_qm,
               int n_iters = 20);
+
+/// Run the same essential-graph optimisation without writing poses or
+/// MapPoints back.  Used by loop closing to reject implausible corrections
+/// before fusing duplicate MapPoints or mutating the map.
+CorrectionStats preview(Map& map,
+                        KeyFrame* query_kf,
+                        KeyFrame* match_kf,
+                        double s_qm,
+                        const Eigen::Matrix3d& R_qm,
+                        const Eigen::Vector3d& t_qm,
+                        int n_iters = 20);
 
 }  // namespace pose_graph
 }  // namespace sslam

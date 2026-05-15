@@ -64,9 +64,11 @@ add_library(sslam
     src/viewer/map_viewer.cpp
     src/frontend/orb_vocabulary.cpp
     src/loop/keyframe_database.cpp
+    src/loop/loop_diagnostics.cpp
     src/loop/place_recognizer.cpp
     src/loop/loop_closing.cpp
     src/optim/sim3_solver.cpp
+    src/optim/sim3_opt.cpp
     src/optim/pose_graph.cpp
     src/optim/full_ba.cpp
 )

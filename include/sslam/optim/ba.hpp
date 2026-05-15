@@ -34,9 +34,11 @@ struct Params {
 
 /// Result of motion-only pose optimisation.
 struct PoseOptResult {
-    Eigen::Matrix4d T_cw;    ///< Refined world-to-camera SE(3) (4×4).
-    int             n_inliers{0};  ///< Edges classified as inliers after the
-                                   ///  final outer iteration.
+    Eigen::Matrix4d      T_cw;    ///< Refined world-to-camera SE(3) (4×4).
+    int                  n_inliers{0};  ///< Edges classified as inliers after the
+                                        ///  final outer iteration.
+    std::vector<bool>    inlier_mask;   ///< Per-observation inlier flag (same order
+                                        ///  as pts3d/obs_stereo). Populated by optimize_pose.
 };
 
 /// Optimise the camera pose given a set of fixed 3-D world points and their
@@ -50,6 +52,10 @@ struct PoseOptResult {
 /// @param obs_stereo  Stereo observations in the current frame: each column
 ///                    is (u_l, v, u_r) for the matching point in pts3d.
 /// @param cam         Camera calibration.
+/// @param octaves     Optional: keypoint octave per observation.  When provided
+///                    the information matrix is scaled by 1/sigma2 where
+///                    sigma2 = scale_factor^(2*octave), scale_factor=1.2.
+///                    If empty, Identity is used (legacy behaviour).
 /// @param p           Optimiser parameters (optional, uses defaults).
 /// @return            Refined pose and final inlier count.
 PoseOptResult optimize_pose(
@@ -57,6 +63,7 @@ PoseOptResult optimize_pose(
     const std::vector<Eigen::Vector3d>& pts3d,
     const std::vector<Eigen::Vector3d>& obs_stereo,
     const StereoCamera&                 cam,
+    const std::vector<int>&             octaves = {},
     const Params&                       p = {});
 
 // ---------------------------------------------------------------------------

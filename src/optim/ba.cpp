@@ -30,6 +30,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstdio>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -62,6 +64,7 @@ PoseOptResult optimize_pose(
     const std::vector<Eigen::Vector3d>& pts3d,
     const std::vector<Eigen::Vector3d>& obs_stereo,
     const StereoCamera&                 cam,
+    const std::vector<int>&             octaves,
     const Params&                       p) {
 
     assert(pts3d.size() == obs_stereo.size());
@@ -90,13 +93,20 @@ PoseOptResult optimize_pose(
     edges.reserve(static_cast<std::size_t>(n));
 
     const double bf = cam.fx * cam.baseline;
+    constexpr double kScaleSq = 1.2 * 1.2;
 
     for (int i = 0; i < n; ++i) {
         auto* e = new g2o::EdgeStereoSE3ProjectXYZOnlyPose();
 
         e->setVertex(0, v);
         e->setMeasurement(obs_stereo[static_cast<std::size_t>(i)]);
-        e->setInformation(Eigen::Matrix3d::Identity());
+
+        // Information matrix: I / sigma2[octave].
+        // sigma2[octave] = (scale_factor)^(2*octave), scale_factor = 1.2.
+        const int oct = (!octaves.empty() && i < static_cast<int>(octaves.size()))
+                        ? octaves[static_cast<std::size_t>(i)] : 0;
+        const double sigma2 = std::pow(kScaleSq, oct);
+        e->setInformation(Eigen::Matrix3d::Identity() * (1.0 / sigma2));
 
         // g2o takes ownership of the kernel pointer; allocate one per edge.
         auto* rk = new g2o::RobustKernelHuber();
@@ -148,8 +158,11 @@ PoseOptResult optimize_pose(
 
     // --- Extract result ----------------------------------------------------
     PoseOptResult result;
-    result.T_cw    = from_se3quat(v->estimate());
+    result.T_cw      = from_se3quat(v->estimate());
     result.n_inliers = n_inliers;
+    result.inlier_mask.resize(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        result.inlier_mask[static_cast<std::size_t>(i)] = (edges[static_cast<std::size_t>(i)]->level() == 0);
     return result;
 }
 
@@ -306,7 +319,20 @@ void local_bundle_adjustment(KeyFrame* kf,
             const cv::KeyPoint& kp = kps[static_cast<std::size_t>(feat_idx)];
             e->setMeasurement(
                 Eigen::Vector3d(kp.pt.x, kp.pt.y, right_u));
-            e->setInformation(Eigen::Matrix3d::Identity());
+
+            // Per-octave information matrix: I / sigma2[octave].
+            {
+                const auto& sf = obs_kf->scale_factors();
+                const int oct  = kp.octave;
+                double sigma2  = 1.0;
+                if (!sf.empty() && oct < static_cast<int>(sf.size())) {
+                    sigma2 = static_cast<double>(sf[static_cast<std::size_t>(oct)]) *
+                             static_cast<double>(sf[static_cast<std::size_t>(oct)]);
+                } else {
+                    sigma2 = std::pow(1.2 * 1.2, oct);
+                }
+                e->setInformation(Eigen::Matrix3d::Identity() * (1.0 / sigma2));
+            }
 
             auto* rk = new g2o::RobustKernelHuber();
             rk->setDelta(p.huber_delta);
@@ -355,7 +381,15 @@ void local_bundle_adjustment(KeyFrame* kf,
     }
 
     // -----------------------------------------------------------------------
-    // 6. Write back optimised poses and point positions, remove outlier obs.
+    // 6. Write back optimised KF poses and MP positions.
+    //
+    //    No magnitude guard: the local window has fixed cameras (KFs that
+    //    observe local MPs but aren't being optimised) plus a fallback
+    //    smallest-id anchor when the map is small, so gauge is constrained
+    //    and large corrections are by construction legitimate.  Matches
+    //    ORB-SLAM2 LocalBundleAdjustment, which writes back unconditionally.
+    // -----------------------------------------------------------------------
+    // 8. Write back optimised poses and point positions, remove outlier obs.
     // -----------------------------------------------------------------------
     for (KeyFrame* lkf : local_kf_set) {
         const auto* v = static_cast<const g2o::VertexSE3Expmap*>(

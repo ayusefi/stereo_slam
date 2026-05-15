@@ -33,6 +33,24 @@ Sim3Solver::Sim3Solver(const std::vector<Eigen::Vector3d>& pts1,
     : pts1_(pts1), pts2_(pts2), p_(p)
 {}
 
+Sim3Solver::Sim3Solver(const std::vector<Eigen::Vector3d>& pts1,
+                       const std::vector<Eigen::Vector3d>& pts2,
+                       const std::vector<Eigen::Vector2d>& obs1,
+                       const std::vector<Eigen::Vector2d>& obs2,
+                       const std::vector<double>& max_err1,
+                       const std::vector<double>& max_err2,
+                       const Eigen::Matrix4d& T_cw_1,
+                       const Eigen::Matrix4d& T_cw_2,
+                       double fx, double fy, double cx, double cy,
+                       const Params& p)
+    : pts1_(pts1), pts2_(pts2), p_(p),
+      use_reprojection_(true),
+      fx_(fx), fy_(fy), cx_(cx), cy_(cy),
+      obs1_(obs1), obs2_(obs2),
+      max_err1_(max_err1), max_err2_(max_err2),
+      T_cw_1_(T_cw_1), T_cw_2_(T_cw_2)
+{}
+
 // ---------------------------------------------------------------------------
 
 bool Sim3Solver::hornN(const Eigen::MatrixXd& p1, const Eigen::MatrixXd& p2,
@@ -62,12 +80,16 @@ bool Sim3Solver::hornN(const Eigen::MatrixXd& p1, const Eigen::MatrixXd& p2,
     const Eigen::Quaterniond q(q_vec(0), q_vec(1), q_vec(2), q_vec(3));
     R = q.normalized().toRotationMatrix();
 
-    // Scale: s = trace(R * sigma) / ||C1||_F^2   (Horn 1987 eq. 42)
-    // = sum_k c2_k . (R * c1_k) / sum_k ||c1_k||^2
-    const double num   = (R * sigma).trace();
-    const double denom = c1.squaredNorm();
-    if (denom < 1e-9 || num < 1e-9) return false;
-    s = num / denom;
+    // Scale: if fix_scale, force s=1 (stereo/RGB-D metric scale).
+    // Otherwise: s = trace(R * sigma) / ||C1||_F^2   (Horn 1987 eq. 42)
+    if (p_.fix_scale) {
+        s = 1.0;
+    } else {
+        const double num   = (R * sigma).trace();
+        const double denom = c1.squaredNorm();
+        if (denom < 1e-9 || num < 1e-9) return false;
+        s = num / denom;
+    }
 
     // Translation.
     t = mu2 - s * R * mu1;
@@ -80,6 +102,8 @@ int Sim3Solver::count_inliers(double s, const Eigen::Matrix3d& R,
                                const Eigen::Vector3d& t,
                                std::vector<bool>& mask) const
 {
+    if (use_reprojection_) return count_inliers_reproj(s, R, t, mask);
+
     const double th2 = p_.inlier_threshold_m * p_.inlier_threshold_m;
     mask.assign(pts1_.size(), false);
     int n = 0;
@@ -89,6 +113,46 @@ int Sim3Solver::count_inliers(double s, const Eigen::Matrix3d& R,
             mask[i] = true;
             ++n;
         }
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+
+int Sim3Solver::count_inliers_reproj(double s, const Eigen::Matrix3d& R,
+                                     const Eigen::Vector3d& t,
+                                     std::vector<bool>& mask) const
+{
+    // Inverse Sim3: p1_world = (1/s) * R^T * (p2_world - t)
+    const Eigen::Matrix3d R_inv = R.transpose();
+    const double          s_inv = 1.0 / s;
+
+    const Eigen::Matrix3d R1 = T_cw_1_.topLeftCorner<3, 3>();
+    const Eigen::Vector3d t1 = T_cw_1_.topRightCorner<3, 1>();
+    const Eigen::Matrix3d R2 = T_cw_2_.topLeftCorner<3, 3>();
+    const Eigen::Vector3d t2 = T_cw_2_.topRightCorner<3, 1>();
+
+    mask.assign(pts1_.size(), false);
+    int n = 0;
+    for (std::size_t i = 0; i < pts1_.size(); ++i) {
+        // Forward: pts1[i] → Sim3 → cam2 → pixel2  vs obs2[i]
+        const Eigen::Vector3d p2c = R2 * (s * R * pts1_[i] + t) + t2;
+        if (p2c.z() <= 0.0) continue;
+        const double u2 = fx_ * p2c.x() / p2c.z() + cx_;
+        const double v2 = fy_ * p2c.y() / p2c.z() + cy_;
+        const double eu2 = u2 - obs2_[i].x(), ev2 = v2 - obs2_[i].y();
+        if (eu2 * eu2 + ev2 * ev2 > max_err2_[i]) continue;
+
+        // Backward: pts2[i] → inv-Sim3 → cam1 → pixel1  vs obs1[i]
+        const Eigen::Vector3d p1c = R1 * (s_inv * R_inv * (pts2_[i] - t)) + t1;
+        if (p1c.z() <= 0.0) continue;
+        const double u1 = fx_ * p1c.x() / p1c.z() + cx_;
+        const double v1 = fy_ * p1c.y() / p1c.z() + cy_;
+        const double eu1 = u1 - obs1_[i].x(), ev1 = v1 - obs1_[i].y();
+        if (eu1 * eu1 + ev1 * ev1 > max_err1_[i]) continue;
+
+        mask[i] = true;
+        ++n;
     }
     return n;
 }
@@ -112,7 +176,9 @@ void Sim3Solver::refine(double& s, Eigen::Matrix3d& R,
         p1_m.col(static_cast<int>(i)) = in1[i];
         p2_m.col(static_cast<int>(i)) = in2[i];
     }
-    hornN(p1_m, p2_m, s, R, t);
+    double s_tmp = s;  // hornN may update scale; for fix_scale=true it stays 1
+    hornN(p1_m, p2_m, s_tmp, R, t);
+    if (!p_.fix_scale) s = s_tmp;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +208,11 @@ Sim3Solver::Result Sim3Solver::solve() {
 
         double s; Eigen::Matrix3d R; Eigen::Vector3d t;
         if (!hornN(p1_m, p2_m, s, R, t)) continue;
-        if (s <= 0.0 || s > 100.0) continue;  // degenerate scale
+        if (p_.fix_scale) {
+            s = 1.0;  // stereo: metric scale fixed
+        } else {
+            if (s <= 0.0 || s > 100.0) continue;  // degenerate scale
+        }
 
         std::vector<bool> mask;
         const int n_in = count_inliers(s, R, t, mask);
