@@ -25,6 +25,7 @@ struct LoopAttemptStats {
     int      graph_components{0};
     double   max_pose_correction_m{0.0};
     double   max_pose_correction_deg{0.0};
+    double   max_adjacent_step_m{0.0};
     bool     accepted{false};
     std::string reject_reason;
 };

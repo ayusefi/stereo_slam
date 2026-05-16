@@ -47,8 +47,6 @@ constexpr int    kMaxLoopCandidatesPerKf = 3;
 constexpr double kMinSim3InlierRatio = 0.15;
 constexpr double kMinLoopBowScore = 0.08;
 constexpr uint64_t kLoopCooldownKfs = 80;
-constexpr double kMaxLoopAnyCorrectionM = 35.0;
-constexpr double kMaxLoopAdjacentStepM = 12.0;
 constexpr double kMaxSim3RmseM = 50.0;
 
 // chi2(0.01, 2) and per-level sigma2 ratio for reprojection thresholds.
@@ -673,23 +671,13 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     stats.graph_components       = pgo_preview.graph_components;
     stats.max_pose_correction_m  = pgo_preview.max_center_correction_m;
     stats.max_pose_correction_deg = pgo_preview.max_rotation_correction_deg;
-    if (!pgo_preview.valid ||
-        pgo_preview.max_center_correction_m > kMaxLoopAnyCorrectionM ||
-        pgo_preview.max_adjacent_step_m > kMaxLoopAdjacentStepM) {
-        stats.reject_reason = !pgo_preview.valid
-            ? (pgo_preview.graph_components > 1 ? "disconnected_graph"
-                                                 : "pgo_invalid")
-            : (pgo_preview.max_center_correction_m > kMaxLoopAnyCorrectionM
-                   ? "pgo_correction_too_large"
-                   : "pgo_adjacent_step_too_large");
+    stats.max_adjacent_step_m    = pgo_preview.max_adjacent_step_m;
+    if (!pgo_preview.valid) {
+        stats.reject_reason = pgo_preview.graph_components > 1
+            ? "disconnected_graph" : "pgo_invalid";
         std::cerr << "[LC] reject q=" << q->id()
                   << " m=" << best_match->id()
-                  << " reason=" << stats.reject_reason
-                  << " query_corr=" << pgo_preview.query_center_correction_m
-                  << " max_corr=" << pgo_preview.max_center_correction_m
-                  << " max_kf=" << pgo_preview.max_center_kf_id
-                  << " max_adj_step=" << pgo_preview.max_adjacent_step_m
-                  << " max_adj_kf=" << pgo_preview.max_adjacent_step_kf_id << "\n";
+                  << " reason=" << stats.reject_reason << "\n";
         log_attempt(stats);
         local_mapping_->resume();
         continue;

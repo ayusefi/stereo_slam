@@ -55,6 +55,7 @@ void LoopLogger::record(const LoopAttemptStats& s) {
       << "\"graph_components\":"   << s.graph_components   << ","
     << "\"max_pose_correction_m\":"   << finite(s.max_pose_correction_m)   << ","
     << "\"max_pose_correction_deg\":" << finite(s.max_pose_correction_deg) << ","
+    << "\"max_adjacent_step_m\":"     << finite(s.max_adjacent_step_m)     << ","
       << "\"accepted\":"           << (s.accepted ? "true" : "false") << ","
       << "\"reject_reason\":\""    << json_str(s.reject_reason) << "\""
       << "}\n";
