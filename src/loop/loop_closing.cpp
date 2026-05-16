@@ -11,6 +11,7 @@
 #include <Eigen/LU>
 
 #include <cmath>
+#include <random>
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -344,7 +345,99 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     }
     stats.correspondences_3d = static_cast<int>(pts_q.size());
 
-    // 3. Sim3 RANSAC — fix_scale=true + bidirectional reprojection inlier test.
+    // 3. Translational consensus prefilter (TCPF) — runs before Sim3 RANSAC.
+    //
+    // For stereo SLAM (s≈1, no scale drift), every true correspondence
+    // (same physical MapPoint seen from both KFs) satisfies:
+    //   d_i = P_q_i - P_m_i  ≈  drift_world   (the accumulated SLAM drift)
+    //
+    // True correspondences therefore cluster in displacement space near the
+    // actual drift vector.  False BoW correspondences (perceptual aliases)
+    // scatter at arbitrary displacements, but in structured urban scenes they
+    // can form a spurious cluster at some OTHER drift value — typically LARGER
+    // than the true drift.
+    //
+    // Physical bound: the maximum plausible drift grows linearly with the KF
+    // span (kTCPFDriftPerKf m per KF).  We seed the RANSAC search only from
+    // displacement vectors within this bound, so spurious clusters at larger
+    // displacements are never selected.  True-cluster correspondences are kept;
+    // everything else is discarded before RANSAC runs.
+    //
+    // No-filter fallback: if no cluster satisfies the bound, all
+    // correspondences are forwarded unchanged (identical to the previous
+    // behaviour).
+    {
+        constexpr double kTCPFRadius     = 5.0;   // cluster radius [m]
+        constexpr int    kTCPFMinVotes   = 15;    // min cluster size to apply
+        constexpr double kTCPFDriftPerKf = 0.10;  // max drift per KF [m/KF]
+        constexpr int    kTCPFIters      = 300;
+
+        const std::size_t n_corr   = pts_q.size();
+        const double      max_drift =
+            kTCPFDriftPerKf * static_cast<double>(
+                q->id() > best_match->id()
+                    ? q->id() - best_match->id()
+                    : best_match->id() - q->id());
+
+        // Compute per-correspondence displacement vectors.
+        std::vector<Eigen::Vector3d> disp(n_corr);
+        for (std::size_t i = 0; i < n_corr; ++i)
+            disp[i] = pts_q[i] - pts_m[i];
+
+        // 1-point RANSAC: find the best vote-winning cluster whose seed
+        // displacement satisfies the drift bound.
+        std::mt19937 rng_tcpf(static_cast<uint32_t>(n_corr * 37 + 19));
+        std::uniform_int_distribution<std::size_t> dist_tcpf(0, n_corr - 1);
+
+        int             best_votes  = 0;
+        Eigen::Vector3d best_center = Eigen::Vector3d::Zero();
+        for (int iter = 0; iter < kTCPFIters; ++iter) {
+            const Eigen::Vector3d& seed = disp[dist_tcpf(rng_tcpf)];
+            if (seed.norm() > max_drift) continue;
+            int votes = 0;
+            for (std::size_t i = 0; i < n_corr; ++i)
+                if ((disp[i] - seed).norm() < kTCPFRadius) ++votes;
+            if (votes > best_votes) { best_votes = votes; best_center = seed; }
+        }
+
+        if (best_votes >= kTCPFMinVotes) {
+            // Refine the cluster center as the mean of its inliers.
+            Eigen::Vector3d center = Eigen::Vector3d::Zero();
+            int cnt = 0;
+            for (std::size_t i = 0; i < n_corr; ++i)
+                if ((disp[i] - best_center).norm() < kTCPFRadius)
+                    { center += disp[i]; ++cnt; }
+            if (cnt > 0) center /= cnt;
+
+            // Apply filter only if the refined center satisfies both the
+            // minimum-drift bound (avoids near-zero noise clusters) and the
+            // maximum-drift bound.
+            if (center.norm() <= max_drift + kTCPFRadius) {
+                std::vector<Eigen::Vector3d>    fq, fm;
+                std::vector<Eigen::Vector2d>    foq, fom;
+                std::vector<double>             feq, fem;
+                std::vector<LoopCorrespondence> fc;
+                for (std::size_t i = 0; i < n_corr; ++i) {
+                    if ((disp[i] - center).norm() < kTCPFRadius) {
+                        fq.push_back(pts_q[i]);       fm.push_back(pts_m[i]);
+                        foq.push_back(obs_q[i]);      fom.push_back(obs_m[i]);
+                        feq.push_back(max_err_q[i]);  fem.push_back(max_err_m[i]);
+                        fc.push_back(sim3_corrs[i]);
+                    }
+                }
+                if (fc.size() >= static_cast<std::size_t>(kMinCorrespondences)) {
+                    pts_q      = std::move(fq);   pts_m      = std::move(fm);
+                    obs_q      = std::move(foq);  obs_m      = std::move(fom);
+                    max_err_q  = std::move(feq);  max_err_m  = std::move(fem);
+                    sim3_corrs = std::move(fc);
+                    stats.correspondences_3d = static_cast<int>(sim3_corrs.size());
+                }
+            }
+        }
+        // If no valid cluster: pts_q/pts_m are unchanged → unfiltered fallback.
+    }
+
+    // 3a. Sim3 RANSAC — fix_scale=true + bidirectional reprojection inlier test.
     Sim3Solver::Params sim3_params;
     sim3_params.fix_scale   = true;
     sim3_params.min_inliers = kMinRansacInliers;
@@ -354,7 +447,8 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
                       T_cw_q, T_cw_m,
                       cam.fx, cam.fy, cam.cx, cam.cy,
                       sim3_params);
-    const auto ransac = solver.solve();
+    auto ransac = solver.solve();
+
     if (!ransac.found) {
         stats.reject_reason = "sim3_ransac_failed";
         log_attempt(stats);
