@@ -24,6 +24,7 @@
 
 #include <Eigen/Core>
 
+#include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -42,7 +43,8 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: " << argv[0]
                   << " <kitti-sequence-dir> [--no-display] [--output <traj.txt>]"
-                     " [--max-frames N] [--gt <poses.txt>] [--loop-log <log.jsonl>]\n";
+                     " [--max-frames N] [--gt <poses.txt>] [--loop-log <log.jsonl>]"
+                     " [--config <config.yaml>]\n";
         return 1;
     }
 
@@ -51,6 +53,7 @@ int main(int argc, char** argv) {
     std::string output_path;
     std::string gt_path;
     std::string loop_log_path;
+    std::string config_path;
     std::size_t max_frames  = std::numeric_limits<std::size_t>::max();
     for (int a = 2; a < argc; ++a) {
         const std::string arg = argv[a];
@@ -63,6 +66,8 @@ int main(int argc, char** argv) {
             gt_path = argv[++a];
         } else if (arg == "--loop-log" && a + 1 < argc) {
             loop_log_path = argv[++a];
+        } else if (arg == "--config" && a + 1 < argc) {
+            config_path = argv[++a];
         } else if (arg == "--max-frames" && a + 1 < argc) {
             max_frames = static_cast<std::size_t>(std::stoul(argv[++a]));
         }
@@ -98,20 +103,55 @@ int main(int argc, char** argv) {
                   << "  cx,cy    : " << cam_ptr->cx << ", " << cam_ptr->cy << "\n"
                   << "  baseline : " << cam_ptr->baseline << " m\n";
 
+        // --- Load optional config (YAML) -------------------------------------
+        sslam::LoopClosing::Params lc_params;
+        sslam::LocalMapping::Params lm_params;
+        std::string vocab_path = "thirdparty/vocab/ORBvoc.txt";
+        if (!config_path.empty()) {
+            cv::FileStorage fs(config_path, cv::FileStorage::READ);
+            if (!fs.isOpened())
+                throw std::runtime_error("Cannot open config: " + config_path);
+            // Loop closing params
+            if (!fs["loop"]["min_bow_score"].empty())
+                lc_params.min_bow_score = static_cast<double>(fs["loop"]["min_bow_score"]);
+            if (!fs["loop"]["cooldown_kfs"].empty())
+                lc_params.cooldown_kfs = static_cast<int>(fs["loop"]["cooldown_kfs"]);
+            if (!fs["loop"]["min_bow_matches"].empty())
+                lc_params.min_bow_matches = static_cast<int>(fs["loop"]["min_bow_matches"]);
+            if (!fs["loop"]["min_correspondences"].empty())
+                lc_params.min_correspondences = static_cast<int>(fs["loop"]["min_correspondences"]);
+            if (!fs["loop"]["min_ransac_inliers"].empty())
+                lc_params.min_ransac_inliers = static_cast<int>(fs["loop"]["min_ransac_inliers"]);
+            if (!fs["loop"]["min_fused_matches"].empty())
+                lc_params.min_fused_matches = static_cast<int>(fs["loop"]["min_fused_matches"]);
+            if (!fs["loop"]["max_candidates_per_kf"].empty())
+                lc_params.max_candidates_per_kf = static_cast<int>(fs["loop"]["max_candidates_per_kf"]);
+            if (!fs["loop"]["min_sim3_inlier_ratio"].empty())
+                lc_params.min_sim3_inlier_ratio = static_cast<double>(fs["loop"]["min_sim3_inlier_ratio"]);
+            if (!fs["loop"]["max_sim3_rmse_m"].empty())
+                lc_params.max_sim3_rmse_m = static_cast<double>(fs["loop"]["max_sim3_rmse_m"]);
+            if (!fs["loop"]["vocab_path"].empty())
+                vocab_path = static_cast<std::string>(fs["loop"]["vocab_path"]);
+            // LocalMapping / BA params
+            if (!fs["local_mapping"]["local_ba_keyframe_window"].empty())
+                lm_params.ba.max_local_kfs = static_cast<int>(fs["local_mapping"]["local_ba_keyframe_window"]);
+            std::cout << "Config         : " << config_path << "\n";
+        }
+
         sslam::Tracking tracker(cam_ptr);
+        tracker.local_mapping()->set_params(lm_params);
 
         // --- Loop closing (optional — skipped if vocabulary is absent) -----
-        constexpr const char* kVocabPath = "thirdparty/vocab/ORBvoc.txt";
         std::unique_ptr<sslam::ORBVocabulary>     vocab;
         std::unique_ptr<sslam::KeyFrameDatabase>  kf_db;
         std::unique_ptr<sslam::LoopLogger>        loop_logger;
         sslam::LoopClosing::Ptr                   loop_closer;
         {
-            std::ifstream probe(kVocabPath);
+            std::ifstream probe(vocab_path);
             if (probe.good()) {
                 vocab = std::make_unique<sslam::ORBVocabulary>();
                 std::cout << "Loading ORB vocabulary ... " << std::flush;
-                vocab->load(kVocabPath);
+                vocab->load(vocab_path);
                 std::cout << "done\n";
                 kf_db = std::make_unique<sslam::KeyFrameDatabase>(*vocab);
                 tracker.local_mapping()->set_vocabulary(vocab.get());
@@ -123,7 +163,8 @@ int main(int argc, char** argv) {
                     tracker.map(),
                     tracker.local_mapping(),
                     vocab.get(),
-                    kf_db.get());
+                    kf_db.get(),
+                    lc_params);
                 tracker.local_mapping()->set_loop_closing(loop_closer.get());
                 if (!loop_log_path.empty()) {
                     loop_logger = std::make_unique<sslam::LoopLogger>(loop_log_path);
@@ -134,7 +175,7 @@ int main(int argc, char** argv) {
                 std::cout << "Loop closing   : enabled\n";
             } else {
                 std::cout << "Loop closing   : disabled (vocabulary not found at "
-                          << kVocabPath << ")\n";
+                          << vocab_path << ")\n";
             }
         }
 

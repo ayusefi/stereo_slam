@@ -44,6 +44,8 @@ class LocalMapping {
         int mappoint_grace_kfs{3};
         /// Minimum observations required after the grace period.
         int min_mappoint_observations{3};
+        /// Bundle adjustment parameters (e.g. local window size).
+        ba::Params ba{};
     };
 
     struct BaStats {
@@ -76,6 +78,9 @@ class LocalMapping {
 
     /// Block until the input queue is empty and the current KF is done.
     void wait_until_idle();
+
+    /// Set mapping and BA parameters (call before start()).
+    void set_params(const Params& p) { params_ = p; }
 
     /// Set vocabulary for BoW computation (call before start()).
     /// If not set, BoW computation is skipped.
@@ -117,7 +122,6 @@ class LocalMapping {
     LoopClosing*                          loop_closing_{nullptr}; // non-owning
     KeyFrameDatabase*                     kf_db_{nullptr};        // non-owning
     Params                                params_;
-    ba::Params                            ba_params_;
 
     // Work queue (Tracking thread pushes, LocalMapping thread pops).
     std::deque<KeyFrame::Ptr>  queue_;

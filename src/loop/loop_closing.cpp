@@ -39,15 +39,6 @@ int hamming(const cv::Mat& a, const cv::Mat& b) {
 constexpr int    kTHLow  = 50;
 constexpr int    kTHHigh = 100;
 constexpr float  kLoweRatio = 0.75f;
-constexpr int    kMinBowMatches = 20;  ///< min descriptor matches to attempt Sim3
-constexpr int    kMinCorrespondences = 20;  ///< min 3-D pairs for Sim3 RANSAC
-constexpr int    kMinRansacInliers  = 20;  ///< min RANSAC inliers (coarse gate)
-constexpr int    kMinFusedMatches   = 30;  ///< min inliers after SearchByProjection + final Sim3
-constexpr int    kMaxLoopCandidatesPerKf = 3;
-constexpr double kMinSim3InlierRatio = 0.15;
-constexpr double kMinLoopBowScore = 0.08;
-constexpr uint64_t kLoopCooldownKfs = 80;
-constexpr double kMaxSim3RmseM = 50.0;
 
 // chi2(0.01, 2) and per-level sigma2 ratio for reprojection thresholds.
 constexpr double kChi2      = 9.210;
@@ -145,10 +136,19 @@ LoopClosing::LoopClosing(Map::Ptr map,
                           LocalMapping::Ptr lm,
                           const ORBVocabulary* vocab,
                           KeyFrameDatabase* db)
+    : LoopClosing(std::move(map), std::move(lm), vocab, db, Params{})
+{}
+
+LoopClosing::LoopClosing(Map::Ptr map,
+                          LocalMapping::Ptr lm,
+                          const ORBVocabulary* vocab,
+                          KeyFrameDatabase* db,
+                          const Params& params)
     : map_(std::move(map))
     , local_mapping_(std::move(lm))
     , vocab_(vocab)
     , db_(db)
+    , params_(params)
     , recognizer_(std::make_unique<PlaceRecognizer>(*db))
 {}
 
@@ -222,7 +222,7 @@ void LoopClosing::run() {
 // ---------------------------------------------------------------------------
 
 bool LoopClosing::try_close_loop(KeyFrame* q) {
-    if (loop_count_.load() > 0 && q->id() < last_loop_kf_id_ + kLoopCooldownKfs)
+    if (loop_count_.load() > 0 && q->id() < last_loop_kf_id_ + params_.cooldown_kfs)
         return false;
 
     // Helper: flush one attempt record to the optional logger.
@@ -240,15 +240,15 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     for (const KeyFrame* c : candidates) {
         if (!c || c->is_bad()) continue;
         const double s = vocab_->score(q_bow, c->bow());
-        if (s >= kMinLoopBowScore) scored.push_back({c, s});
+        if (s >= params_.min_bow_score) scored.push_back({c, s});
     }
     if (scored.empty()) return false;
     std::sort(scored.begin(), scored.end(),
               [](const ScoredLoopCandidate& a, const ScoredLoopCandidate& b) {
                   return a.score > b.score;
               });
-    if (static_cast<int>(scored.size()) > kMaxLoopCandidatesPerKf)
-        scored.resize(static_cast<std::size_t>(kMaxLoopCandidatesPerKf));
+    if (static_cast<int>(scored.size()) > params_.max_candidates_per_kf)
+        scored.resize(static_cast<std::size_t>(params_.max_candidates_per_kf));
 
     for (const ScoredLoopCandidate& candidate : scored) {
         const KeyFrame* best_match = candidate.kf;
@@ -264,7 +264,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     // back-projection only when no MP is associated.
     const auto feat_matches = match_by_bow(q, best_match);
     stats.bow_matches = static_cast<int>(feat_matches.size());
-    if (feat_matches.size() < kMinBowMatches) {
+    if (feat_matches.size() < static_cast<std::size_t>(params_.min_bow_matches)) {
         stats.reject_reason = "insufficient_bow_matches";
         log_attempt(stats);
         continue;
@@ -335,7 +335,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
         }
     }
 
-    if (pts_q.size() < kMinCorrespondences) {
+    if (pts_q.size() < static_cast<std::size_t>(params_.min_correspondences)) {
         stats.correspondences_3d = static_cast<int>(pts_q.size());
         stats.reject_reason = "insufficient_correspondences";
         log_attempt(stats);
@@ -423,7 +423,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
                         fc.push_back(sim3_corrs[i]);
                     }
                 }
-                if (fc.size() >= static_cast<std::size_t>(kMinCorrespondences)) {
+                if (fc.size() >= static_cast<std::size_t>(params_.min_correspondences)) {
                     pts_q      = std::move(fq);   pts_m      = std::move(fm);
                     obs_q      = std::move(foq);  obs_m      = std::move(fom);
                     max_err_q  = std::move(feq);  max_err_m  = std::move(fem);
@@ -438,7 +438,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     // 3a. Sim3 RANSAC — fix_scale=true + bidirectional reprojection inlier test.
     Sim3Solver::Params sim3_params;
     sim3_params.fix_scale   = true;
-    sim3_params.min_inliers = kMinRansacInliers;
+    sim3_params.min_inliers = params_.min_ransac_inliers;
     sim3_params.max_iterations = 300;
     Sim3Solver solver(pts_q, pts_m,
                       obs_q, obs_m, max_err_q, max_err_m,
@@ -480,7 +480,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     std::vector<bool> seed_mask = sim3_opt.inlier_mask;
     int               seed_inliers = sim3_opt.n_inliers;
 
-    if (sim3_opt.n_inliers < kMinRansacInliers) {
+    if (sim3_opt.n_inliers < params_.min_ransac_inliers) {
         s_ref = ransac.scale;
         R_ref = ransac.R;
         t_ref = ransac.t;
@@ -505,7 +505,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
         }
         stats.sim3_rmse_m = (n > 0) ? std::sqrt(sum_sq / n) : 0.0;
     }
-    if (stats.sim3_rmse_m > kMaxSim3RmseM) {
+    if (stats.sim3_rmse_m > params_.max_sim3_rmse_m) {
         stats.reject_reason = "sim3_rmse_too_large";
         log_attempt(stats);
         continue;
@@ -602,7 +602,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
 
     // Count total matches with valid 3D points (inliers + SearchByProjection).
     const int n_fused = static_cast<int>(sim3_corrs.size());
-    if (n_fused < kMinFusedMatches) {
+    if (n_fused < params_.min_fused_matches) {
         stats.reject_reason = "insufficient_fused_matches";
         log_attempt(stats);
         continue;
@@ -624,12 +624,12 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     stats.sim3_inlier_ratio =
         static_cast<double>(final_sim3.n_inliers) / static_cast<double>(sim3_corrs.size());
 
-    if (final_sim3.n_inliers < kMinFusedMatches) {
+    if (final_sim3.n_inliers < params_.min_fused_matches) {
         stats.reject_reason = "sim3_final_insufficient_inliers";
         log_attempt(stats);
         continue;
     }
-    if (stats.sim3_inlier_ratio < kMinSim3InlierRatio) {
+    if (stats.sim3_inlier_ratio < params_.min_sim3_inlier_ratio) {
         stats.reject_reason = "sim3_inlier_ratio_too_low";
         log_attempt(stats);
         continue;
@@ -650,7 +650,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
         }
         stats.sim3_rmse_m = (n > 0) ? std::sqrt(sum_sq / n) : 0.0;
     }
-    if (stats.sim3_rmse_m > kMaxSim3RmseM) {
+    if (stats.sim3_rmse_m > params_.max_sim3_rmse_m) {
         stats.reject_reason = "sim3_rmse_too_large";
         log_attempt(stats);
         continue;
@@ -663,7 +663,8 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     std::unique_lock<std::shared_mutex> map_update_lk(map_->update_mutex_);
 
     const auto pgo_preview = pose_graph::preview(
-        *map_, q, const_cast<KeyFrame*>(best_match), s_ref, R_ref, t_ref);
+        *map_, q, const_cast<KeyFrame*>(best_match), s_ref, R_ref, t_ref,
+        final_sim3.n_inliers);
 
     // Fill topology and correction stats from preview.
     stats.graph_vertices         = pgo_preview.graph_vertices;
@@ -721,7 +722,8 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     pose_graph::optimize(*map_,
                           q,
                           const_cast<KeyFrame*>(best_match),
-                          s_ref, R_ref, t_ref);
+                          s_ref, R_ref, t_ref,
+                          final_sim3.n_inliers);
 
     local_mapping_->resume();
 

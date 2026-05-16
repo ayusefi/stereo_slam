@@ -276,4 +276,10 @@ std::vector<KeyFrame*> KeyFrame::get_covisibility_keyframes(int min_weight) cons
     return result;
 }
 
+int KeyFrame::get_covisibility_weight(const KeyFrame* kf) const {
+    std::scoped_lock lk(obs_mutex_);
+    const auto it = covisibility_.find(const_cast<KeyFrame*>(kf));
+    return (it != covisibility_.end()) ? it->second : 0;
+}
+
 }  // namespace sslam
