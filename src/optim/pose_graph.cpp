@@ -49,6 +49,7 @@ CorrectionStats optimize_impl(Map& map,
                               double s_qm,
                               const Eigen::Matrix3d& R_qm,
                               const Eigen::Vector3d& t_qm,
+                              int loop_inliers,
                               int n_iters,
                               bool write_back) {
     CorrectionStats stats;
@@ -91,46 +92,50 @@ CorrectionStats optimize_impl(Map& map,
 
     int edge_id = static_cast<int>(all_kfs.size()) + 1000;
     std::vector<std::pair<KeyFrame*, KeyFrame*>> edge_endpoints;
-    auto add_edge = [&](KeyFrame* ka, KeyFrame* kb, const g2o::Sim3& meas) {
+    auto add_edge = [&](KeyFrame* ka, KeyFrame* kb, const g2o::Sim3& meas,
+                        double info_scale = 1.0) {
         if (!v_map.count(ka) || !v_map.count(kb)) return;
         auto* e = new g2o::EdgeSim3();
         e->setId(++edge_id);
         e->setVertex(0, v_map.at(ka));
         e->setVertex(1, v_map.at(kb));
         e->setMeasurement(meas);
-        e->setInformation(Eigen::Matrix<double, 7, 7>::Identity());
+        e->setInformation(info_scale * Eigen::Matrix<double, 7, 7>::Identity());
         opt.addEdge(e);
         edge_endpoints.emplace_back(ka, kb);
     };
 
     for (const KeyFrame::Ptr& kf : all_kfs) {
         if (kf->is_bad()) continue;
-        // Spanning-tree edge: kf → parent
+        // Spanning-tree edge: kf → parent (info_scale = 1.0)
         if (kf->parent() && !kf->parent()->is_bad()) {
             if (!old_T_cw.count(kf->parent())) continue; // shouldn't happen
             const g2o::Sim3 s_pk = se3_to_sim3(old_T_cw.at(kf->parent()))
                                   * se3_to_sim3(old_T_cw.at(kf.get())).inverse();
-            add_edge(kf.get(), kf->parent(), s_pk);
+            add_edge(kf.get(), kf->parent(), s_pk, 1.0);
         }
-        // Covisibility edges (weight >= kMinCovisWeight only — essential graph)
+        // Covisibility edges: scale by covisibility weight (capped at 3×)
         for (KeyFrame* cov : kf->get_covisibility_keyframes(kMinCovisWeight)) {
             if (cov->id() >= kf->id() || cov->is_bad()) continue;
             if (!old_T_cw.count(cov)) continue;
+            const int w = kf->get_covisibility_weight(cov);
+            const double info_scale = std::min(3.0, w / 100.0);
             const g2o::Sim3 s_ck = se3_to_sim3(old_T_cw.at(cov))
                                   * se3_to_sim3(old_T_cw.at(kf.get())).inverse();
-            add_edge(kf.get(), cov, s_ck);
+            add_edge(kf.get(), cov, s_ck, info_scale);
         }
     }
 
-    // Loop-closure constraint edge (uses pre-PGO poses via old_T_cw).
+    // Loop-closure constraint edge: scale by inlier quality
     {
+        const double loop_info_scale = std::max(1.0, loop_inliers / 30.0);
         const g2o::Sim3 S_w(Eigen::Quaterniond(R_qm).normalized(), t_qm, s_qm);
         const g2o::Sim3 S_q_old = se3_to_sim3(old_T_cw.at(query_kf));
         const g2o::Sim3 S_m     = se3_to_sim3(old_T_cw.at(match_kf));
         const g2o::Sim3 S_q_corr = S_q_old * S_w.inverse();
         if (v_map.count(query_kf))
             v_map.at(query_kf)->setEstimate(S_q_corr);
-        add_edge(match_kf, query_kf, S_q_corr * S_m.inverse());
+        add_edge(match_kf, query_kf, S_q_corr * S_m.inverse(), loop_info_scale);
     }
 
     // --- Connectivity check via union-find --------------------------------
@@ -272,10 +277,11 @@ void optimize(Map& map,
               double s_qm,
               const Eigen::Matrix3d& R_qm,
               const Eigen::Vector3d& t_qm,
+              int loop_inliers,
               int n_iters)
 {
     (void)optimize_impl(map, query_kf, match_kf, s_qm, R_qm, t_qm,
-                        n_iters, true);
+                        loop_inliers, n_iters, true);
 }
 
 CorrectionStats preview(Map& map,
@@ -284,9 +290,10 @@ CorrectionStats preview(Map& map,
                         double s_qm,
                         const Eigen::Matrix3d& R_qm,
                         const Eigen::Vector3d& t_qm,
+                        int loop_inliers,
                         int n_iters) {
     return optimize_impl(map, query_kf, match_kf, s_qm, R_qm, t_qm,
-                         n_iters, false);
+                         loop_inliers, n_iters, false);
 }
 
 }  // namespace pose_graph
