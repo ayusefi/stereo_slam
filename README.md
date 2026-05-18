@@ -39,6 +39,14 @@ cmake --build build -j$(nproc)
 
 > Latest benchmark run from `bench/49dca96`. ATE = Absolute Trajectory Error after Umeyama alignment.
 
+### KITTI Seq 00 — Pangolin Map Viewer
+
+Map points (white) and keyframe trajectory (red) after full sequence
+processing with loop closure.  The two large intersecting loops of the
+Karlsruhe campus route are clearly resolved.
+
+![KITTI seq 00 — map points and keyframe trajectory](results/seq00_pangolin.png)
+
 ### Combined Top-Down Comparison
 
 ![Combined trajectory comparison](results/traj_00_02_07_08.png)
