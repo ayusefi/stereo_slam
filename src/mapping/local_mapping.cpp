@@ -108,7 +108,7 @@ void LocalMapping::run() {
         // Compute BoW for the new KF so KeyFrameDatabase can index it.
         if (vocab_) kf->compute_bow(*vocab_);
         const auto ba_t0 = std::chrono::steady_clock::now();
-        ba::local_bundle_adjustment(kf.get(), *cam_, ba_params_);
+        ba::local_bundle_adjustment(kf.get(), *cam_, params_.ba);
         const auto ba_t1 = std::chrono::steady_clock::now();
         record_ba_time(
             std::chrono::duration<double, std::milli>(ba_t1 - ba_t0).count());
