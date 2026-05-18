@@ -111,6 +111,7 @@ for SEQ in "${SEQ_LIST[@]}"; do
     CMD=("$APP" "$SEQ_DIR"
          --no-display
          --output "$OUT_SEQ/traj.txt")
+    [[ -f "$REPO_ROOT/configs/kitti.yaml" ]] && CMD+=(--config "$REPO_ROOT/configs/kitti.yaml")
     [[ -f "$GT_FILE"      ]] && CMD+=(--gt "$GT_FILE")
     [[ -n "$MAX_FRAMES"   ]] && CMD+=(--max-frames "$MAX_FRAMES")
 
