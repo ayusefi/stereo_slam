@@ -103,6 +103,9 @@ class KeyFrame {
     /// Return covisible KFs with weight >= min_weight, sorted descending.
     std::vector<KeyFrame*> get_covisibility_keyframes(int min_weight = 0) const;
 
+    /// Return the covisibility weight with a specific KeyFrame (0 if not connected).
+    int get_covisibility_weight(const KeyFrame* kf) const;
+
     // --- Spanning tree ----------------------------------------------------
     KeyFrame* parent() const { return parent_; }
 
