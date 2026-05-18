@@ -11,7 +11,6 @@
 #include <Eigen/LU>
 
 #include <cmath>
-#include <random>
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -39,15 +38,6 @@ int hamming(const cv::Mat& a, const cv::Mat& b) {
 constexpr int    kTHLow  = 50;
 constexpr int    kTHHigh = 100;
 constexpr float  kLoweRatio = 0.75f;
-constexpr int    kMinBowMatches = 20;  ///< min descriptor matches to attempt Sim3
-constexpr int    kMinCorrespondences = 20;  ///< min 3-D pairs for Sim3 RANSAC
-constexpr int    kMinRansacInliers  = 20;  ///< min RANSAC inliers (coarse gate)
-constexpr int    kMinFusedMatches   = 30;  ///< min inliers after SearchByProjection + final Sim3
-constexpr int    kMaxLoopCandidatesPerKf = 3;
-constexpr double kMinSim3InlierRatio = 0.15;
-constexpr double kMinLoopBowScore = 0.08;
-constexpr uint64_t kLoopCooldownKfs = 80;
-constexpr double kMaxSim3RmseM = 50.0;
 
 // chi2(0.01, 2) and per-level sigma2 ratio for reprojection thresholds.
 constexpr double kChi2      = 9.210;
@@ -145,11 +135,20 @@ LoopClosing::LoopClosing(Map::Ptr map,
                           LocalMapping::Ptr lm,
                           const ORBVocabulary* vocab,
                           KeyFrameDatabase* db)
+    : LoopClosing(std::move(map), std::move(lm), vocab, db, Params{})
+{}
+
+LoopClosing::LoopClosing(Map::Ptr map,
+                          LocalMapping::Ptr lm,
+                          const ORBVocabulary* vocab,
+                          KeyFrameDatabase* db,
+                          const Params& params)
     : map_(std::move(map))
     , local_mapping_(std::move(lm))
     , vocab_(vocab)
     , db_(db)
-    , recognizer_(std::make_unique<PlaceRecognizer>(*db))
+    , params_(params)
+    , recognizer_(std::make_unique<PlaceRecognizer>(*db, params_.min_bow_score))
 {}
 
 LoopClosing::~LoopClosing() {
@@ -208,12 +207,18 @@ void LoopClosing::run() {
         db_->add(kf.get());
 
         processing_.store(true);
-        static std::atomic<int> lc_kf_count{0};
-        const int kf_idx = ++lc_kf_count;
-        if (kf_idx % 50 == 0)
-            std::cerr << "[LC] processed " << kf_idx << " KFs\n";
-        const bool closed = try_close_loop(kf.get());
-        if (closed) std::cerr << "[LC] *** LOOP CLOSED at KF " << kf->id() << " ***\n";
+        try {
+            static std::atomic<int> lc_kf_count{0};
+            const int kf_idx = ++lc_kf_count;
+            if (kf_idx % 50 == 0)
+                std::cerr << "[LC] processed " << kf_idx << " KFs\n";
+            const bool closed = try_close_loop(kf.get());
+            if (closed) std::cerr << "[LC] *** LOOP CLOSED at KF " << kf->id() << " ***\n";
+        } catch (const std::exception& e) {
+            std::cerr << "[LC] uncaught exception: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "[LC] uncaught unknown exception\n";
+        }
         processing_.store(false);
         idle_cv_.notify_all();
     }
@@ -222,7 +227,8 @@ void LoopClosing::run() {
 // ---------------------------------------------------------------------------
 
 bool LoopClosing::try_close_loop(KeyFrame* q) {
-    if (loop_count_.load() > 0 && q->id() < last_loop_kf_id_ + kLoopCooldownKfs)
+    if (loop_count_.load() > 0 &&
+        q->id() < last_loop_kf_id_ + params_.cooldown_kfs)
         return false;
 
     // Helper: flush one attempt record to the optional logger.
@@ -240,15 +246,15 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     for (const KeyFrame* c : candidates) {
         if (!c || c->is_bad()) continue;
         const double s = vocab_->score(q_bow, c->bow());
-        if (s >= kMinLoopBowScore) scored.push_back({c, s});
+        if (s >= params_.min_bow_score) scored.push_back({c, s});
     }
     if (scored.empty()) return false;
     std::sort(scored.begin(), scored.end(),
               [](const ScoredLoopCandidate& a, const ScoredLoopCandidate& b) {
                   return a.score > b.score;
               });
-    if (static_cast<int>(scored.size()) > kMaxLoopCandidatesPerKf)
-        scored.resize(static_cast<std::size_t>(kMaxLoopCandidatesPerKf));
+    if (static_cast<int>(scored.size()) > params_.max_candidates_per_kf)
+        scored.resize(static_cast<std::size_t>(params_.max_candidates_per_kf));
 
     for (const ScoredLoopCandidate& candidate : scored) {
         const KeyFrame* best_match = candidate.kf;
@@ -264,7 +270,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     // back-projection only when no MP is associated.
     const auto feat_matches = match_by_bow(q, best_match);
     stats.bow_matches = static_cast<int>(feat_matches.size());
-    if (feat_matches.size() < kMinBowMatches) {
+    if (feat_matches.size() < static_cast<std::size_t>(params_.min_bow_matches)) {
         stats.reject_reason = "insufficient_bow_matches";
         log_attempt(stats);
         continue;
@@ -335,7 +341,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
         }
     }
 
-    if (pts_q.size() < kMinCorrespondences) {
+    if (pts_q.size() < static_cast<std::size_t>(params_.min_correspondences)) {
         stats.correspondences_3d = static_cast<int>(pts_q.size());
         stats.reject_reason = "insufficient_correspondences";
         log_attempt(stats);
@@ -343,109 +349,17 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     }
     stats.correspondences_3d = static_cast<int>(pts_q.size());
 
-    // 3. Translational consensus prefilter (TCPF) — runs before Sim3 RANSAC.
-    //
-    // For stereo SLAM (s≈1, no scale drift), every true correspondence
-    // (same physical MapPoint seen from both KFs) satisfies:
-    //   d_i = P_q_i - P_m_i  ≈  drift_world   (the accumulated SLAM drift)
-    //
-    // True correspondences therefore cluster in displacement space near the
-    // actual drift vector.  False BoW correspondences (perceptual aliases)
-    // scatter at arbitrary displacements, but in structured urban scenes they
-    // can form a spurious cluster at some OTHER drift value — typically LARGER
-    // than the true drift.
-    //
-    // Physical bound: the maximum plausible drift grows linearly with the KF
-    // span (kTCPFDriftPerKf m per KF).  We seed the RANSAC search only from
-    // displacement vectors within this bound, so spurious clusters at larger
-    // displacements are never selected.  True-cluster correspondences are kept;
-    // everything else is discarded before RANSAC runs.
-    //
-    // No-filter fallback: if no cluster satisfies the bound, all
-    // correspondences are forwarded unchanged (identical to the previous
-    // behaviour).
-    {
-        constexpr double kTCPFRadius     = 5.0;   // cluster radius [m]
-        constexpr int    kTCPFMinVotes   = 15;    // min cluster size to apply
-        constexpr double kTCPFDriftPerKf = 0.10;  // max drift per KF [m/KF]
-        constexpr int    kTCPFIters      = 300;
-
-        const std::size_t n_corr   = pts_q.size();
-        const double      max_drift =
-            kTCPFDriftPerKf * static_cast<double>(
-                q->id() > best_match->id()
-                    ? q->id() - best_match->id()
-                    : best_match->id() - q->id());
-
-        // Compute per-correspondence displacement vectors.
-        std::vector<Eigen::Vector3d> disp(n_corr);
-        for (std::size_t i = 0; i < n_corr; ++i)
-            disp[i] = pts_q[i] - pts_m[i];
-
-        // 1-point RANSAC: find the best vote-winning cluster whose seed
-        // displacement satisfies the drift bound.
-        std::mt19937 rng_tcpf(static_cast<uint32_t>(n_corr * 37 + 19));
-        std::uniform_int_distribution<std::size_t> dist_tcpf(0, n_corr - 1);
-
-        int             best_votes  = 0;
-        Eigen::Vector3d best_center = Eigen::Vector3d::Zero();
-        for (int iter = 0; iter < kTCPFIters; ++iter) {
-            const Eigen::Vector3d& seed = disp[dist_tcpf(rng_tcpf)];
-            if (seed.norm() > max_drift) continue;
-            int votes = 0;
-            for (std::size_t i = 0; i < n_corr; ++i)
-                if ((disp[i] - seed).norm() < kTCPFRadius) ++votes;
-            if (votes > best_votes) { best_votes = votes; best_center = seed; }
-        }
-
-        if (best_votes >= kTCPFMinVotes) {
-            // Refine the cluster center as the mean of its inliers.
-            Eigen::Vector3d center = Eigen::Vector3d::Zero();
-            int cnt = 0;
-            for (std::size_t i = 0; i < n_corr; ++i)
-                if ((disp[i] - best_center).norm() < kTCPFRadius)
-                    { center += disp[i]; ++cnt; }
-            if (cnt > 0) center /= cnt;
-
-            // Apply filter only if the refined center satisfies both the
-            // minimum-drift bound (avoids near-zero noise clusters) and the
-            // maximum-drift bound.
-            if (center.norm() <= max_drift + kTCPFRadius) {
-                std::vector<Eigen::Vector3d>    fq, fm;
-                std::vector<Eigen::Vector2d>    foq, fom;
-                std::vector<double>             feq, fem;
-                std::vector<LoopCorrespondence> fc;
-                for (std::size_t i = 0; i < n_corr; ++i) {
-                    if ((disp[i] - center).norm() < kTCPFRadius) {
-                        fq.push_back(pts_q[i]);       fm.push_back(pts_m[i]);
-                        foq.push_back(obs_q[i]);      fom.push_back(obs_m[i]);
-                        feq.push_back(max_err_q[i]);  fem.push_back(max_err_m[i]);
-                        fc.push_back(sim3_corrs[i]);
-                    }
-                }
-                if (fc.size() >= static_cast<std::size_t>(kMinCorrespondences)) {
-                    pts_q      = std::move(fq);   pts_m      = std::move(fm);
-                    obs_q      = std::move(foq);  obs_m      = std::move(fom);
-                    max_err_q  = std::move(feq);  max_err_m  = std::move(fem);
-                    sim3_corrs = std::move(fc);
-                    stats.correspondences_3d = static_cast<int>(sim3_corrs.size());
-                }
-            }
-        }
-        // If no valid cluster: pts_q/pts_m are unchanged → unfiltered fallback.
-    }
-
-    // 3a. Sim3 RANSAC — fix_scale=true + bidirectional reprojection inlier test.
+    // 3. Sim3 RANSAC — fix_scale=true + bidirectional reprojection inlier test.
     Sim3Solver::Params sim3_params;
     sim3_params.fix_scale   = true;
-    sim3_params.min_inliers = kMinRansacInliers;
+    sim3_params.min_inliers = params_.min_ransac_inliers;
     sim3_params.max_iterations = 300;
     Sim3Solver solver(pts_q, pts_m,
                       obs_q, obs_m, max_err_q, max_err_m,
                       T_cw_q, T_cw_m,
                       cam.fx, cam.fy, cam.cx, cam.cy,
                       sim3_params);
-    auto ransac = solver.solve();
+    const auto ransac = solver.solve();
 
     if (!ransac.found) {
         stats.reject_reason = "sim3_ransac_failed";
@@ -480,7 +394,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     std::vector<bool> seed_mask = sim3_opt.inlier_mask;
     int               seed_inliers = sim3_opt.n_inliers;
 
-    if (sim3_opt.n_inliers < kMinRansacInliers) {
+    if (sim3_opt.n_inliers < params_.min_ransac_inliers) {
         s_ref = ransac.scale;
         R_ref = ransac.R;
         t_ref = ransac.t;
@@ -505,7 +419,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
         }
         stats.sim3_rmse_m = (n > 0) ? std::sqrt(sum_sq / n) : 0.0;
     }
-    if (stats.sim3_rmse_m > kMaxSim3RmseM) {
+    if (stats.sim3_rmse_m > params_.max_sim3_rmse_m) {
         stats.reject_reason = "sim3_rmse_too_large";
         log_attempt(stats);
         continue;
@@ -602,7 +516,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
 
     // Count total matches with valid 3D points (inliers + SearchByProjection).
     const int n_fused = static_cast<int>(sim3_corrs.size());
-    if (n_fused < kMinFusedMatches) {
+    if (n_fused < params_.min_fused_matches) {
         stats.reject_reason = "insufficient_fused_matches";
         log_attempt(stats);
         continue;
@@ -624,12 +538,12 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     stats.sim3_inlier_ratio =
         static_cast<double>(final_sim3.n_inliers) / static_cast<double>(sim3_corrs.size());
 
-    if (final_sim3.n_inliers < kMinFusedMatches) {
+    if (final_sim3.n_inliers < params_.min_fused_matches) {
         stats.reject_reason = "sim3_final_insufficient_inliers";
         log_attempt(stats);
         continue;
     }
-    if (stats.sim3_inlier_ratio < kMinSim3InlierRatio) {
+    if (stats.sim3_inlier_ratio < params_.min_sim3_inlier_ratio) {
         stats.reject_reason = "sim3_inlier_ratio_too_low";
         log_attempt(stats);
         continue;
@@ -650,7 +564,7 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
         }
         stats.sim3_rmse_m = (n > 0) ? std::sqrt(sum_sq / n) : 0.0;
     }
-    if (stats.sim3_rmse_m > kMaxSim3RmseM) {
+    if (stats.sim3_rmse_m > params_.max_sim3_rmse_m) {
         stats.reject_reason = "sim3_rmse_too_large";
         log_attempt(stats);
         continue;
@@ -663,7 +577,8 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     std::unique_lock<std::shared_mutex> map_update_lk(map_->update_mutex_);
 
     const auto pgo_preview = pose_graph::preview(
-        *map_, q, const_cast<KeyFrame*>(best_match), s_ref, R_ref, t_ref);
+        *map_, q, const_cast<KeyFrame*>(best_match), s_ref, R_ref, t_ref,
+        final_sim3.n_inliers);
 
     // Fill topology and correction stats from preview.
     stats.graph_vertices         = pgo_preview.graph_vertices;
@@ -678,6 +593,17 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
         std::cerr << "[LC] reject q=" << q->id()
                   << " m=" << best_match->id()
                   << " reason=" << stats.reject_reason << "\n";
+        log_attempt(stats);
+        local_mapping_->resume();
+        continue;
+    }
+    if (pgo_preview.max_adjacent_step_m > params_.max_pgo_adjacent_step_m) {
+        stats.reject_reason = "pgo_adjacent_step_too_large";
+        std::cerr << "[LC] reject q=" << q->id()
+                  << " m=" << best_match->id()
+                  << " reason=" << stats.reject_reason
+                  << " max_adj_step=" << pgo_preview.max_adjacent_step_m
+                  << " limit=" << params_.max_pgo_adjacent_step_m << "\n";
         log_attempt(stats);
         local_mapping_->resume();
         continue;
@@ -721,7 +647,9 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     pose_graph::optimize(*map_,
                           q,
                           const_cast<KeyFrame*>(best_match),
-                          s_ref, R_ref, t_ref);
+                          s_ref, R_ref, t_ref,
+                          final_sim3.n_inliers,
+                          /*n_iters=*/50);
 
     local_mapping_->resume();
 
@@ -731,6 +659,8 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     // wait on a large async solve and prevented trajectory export.
     last_loop_kf_id_ = q->id();
     ++loop_count_;
+    recognizer_->reset();  // Clear stale consistency state; detection restarts
+                           // fresh after the PGO corrects the covisibility graph.
 
     return true;
     }

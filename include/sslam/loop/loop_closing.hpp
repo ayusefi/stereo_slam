@@ -37,14 +37,45 @@ class LoopClosing {
    public:
     using Ptr = std::shared_ptr<LoopClosing>;
 
+    /// Tunable loop-closing parameters.  All values have defaults that match
+    /// the previous hardcoded behaviour, so constructing with Params{} is
+    /// backward-compatible.
+    struct Params {
+        /// Minimum BoW similarity score to consider a candidate.
+        double   min_bow_score{0.04};
+        /// Minimum BoW descriptor matches needed to attempt Sim3.
+        int      min_bow_matches{20};
+        /// Minimum 3-D correspondences for Sim3 RANSAC.
+        int      min_correspondences{20};
+        /// Minimum Sim3 RANSAC inliers (coarse gate).
+        int      min_ransac_inliers{20};
+        /// Minimum inliers after SearchByProjection + final Sim3 refinement.
+        int      min_fused_matches{30};
+        /// Maximum loop candidates to evaluate per query KeyFrame.
+        int      max_candidates_per_kf{3};
+        /// Minimum Sim3 inlier ratio (inliers / total correspondences).
+        double   min_sim3_inlier_ratio{0.15};
+        /// Maximum Sim3 reprojection RMSE [metres] for sanity check.
+        double   max_sim3_rmse_m{50.0};
+        /// Minimum KeyFrames between consecutive loop corrections.
+        /// Prevents rapid re-triggering while the map is still being updated.
+        uint64_t cooldown_kfs{20};
+    };
+
     /// @param map      Shared map.
     /// @param lm       LocalMapping — paused during map correction.
     /// @param vocab    ORB vocabulary (non-owning).
     /// @param db       KeyFrameDatabase (non-owning).
+    /// @param params   Tunable parameters (optional; uses defaults if omitted).
     LoopClosing(Map::Ptr map,
                 LocalMapping::Ptr lm,
                 const ORBVocabulary* vocab,
                 KeyFrameDatabase* db);
+    LoopClosing(Map::Ptr map,
+                LocalMapping::Ptr lm,
+                const ORBVocabulary* vocab,
+                KeyFrameDatabase* db,
+                const Params& params);
     ~LoopClosing();
 
     void start();     ///< Spawn the loop-closing thread.
@@ -79,6 +110,7 @@ class LoopClosing {
     LocalMapping::Ptr   local_mapping_;
     const ORBVocabulary* vocab_;   // non-owning
     KeyFrameDatabase*   db_;       // non-owning
+    Params              params_;
 
     std::unique_ptr<PlaceRecognizer> recognizer_;
     FullBA::Ptr                      full_ba_;  ///< background full BA after each correction
