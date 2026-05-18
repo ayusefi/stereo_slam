@@ -193,8 +193,14 @@ Tracking::FrameResult Tracking::process_frame(std::size_t idx, double ts,
                              static_cast<float>(p_w.y()),
                              static_cast<float>(p_w.z())});
             pts2d.push_back(kp_curr.pt);
-            const double u_r =
-                static_cast<double>(kp_curr.pt.x) - static_cast<double>(bf) / d;
+            // Use current-frame stereo depth for the right-image observation;
+            // fall back to the previous-frame depth when the current feature
+            // has no stereo match.
+            const float d_curr = frame->depth[static_cast<std::size_t>(ci)];
+            const double z_curr = (d_curr > 0.0f)
+                ? static_cast<double>(d_curr)
+                : static_cast<double>(d);
+            const double u_r = static_cast<double>(kp_curr.pt.x) - bf / z_curr;
             obs_stereo.push_back({static_cast<double>(kp_curr.pt.x),
                                   static_cast<double>(kp_curr.pt.y),
                                   u_r});
@@ -442,12 +448,10 @@ bool Tracking::match_local_map_(
 {
     if (!last_kf_ || last_kf_->is_bad()) return false;
 
-    // Candidate set: reference KF only.  A full ORB-SLAM TrackLocalMap also
-    // uses covisible neighbours, but only with additional viewing-angle,
-    // predicted-scale, and orientation-consistency checks.  With the current
-    // simplified matcher, the broad covisible set admits enough aliases to
-    // pull motion-only BA onto the wrong pose on KITTI 00.
-    constexpr int kMaxLocalKFs = 0;
+    // Candidate set: last KF + up to 10 covisible neighbours.
+    // Viewing-angle, predicted-scale, and orientation-consistency guards
+    // are applied below to suppress aliases.
+    constexpr int kMaxLocalKFs = 10;
     std::vector<KeyFrame*> local_kfs{last_kf_.get()};
     {
         auto covis = last_kf_->get_covisibility_keyframes(0);
