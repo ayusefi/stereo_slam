@@ -29,7 +29,14 @@ struct Params {
     /// window.  Caps the optimisation problem size as the map grows.
     int max_local_kfs{20};
     /// Maximum number of MapPoints included in one local BA solve.
-    int max_local_mps{1000};
+    int max_local_mps{5000};
+    /// Maximum permitted per-KeyFrame translation correction (metres) from a
+    /// single local BA call.  If any free KF moves further than this, or any
+    /// optimised vertex contains NaN, the entire BA result is discarded and
+    /// no writeback is performed.  Guards against optimizer divergence when
+    /// pass 1 removes nearly all edges (degenerate MP set) and pass 2 runs
+    /// with almost no constraints.
+    double max_kf_correction{10.0};
 };
 
 /// Result of motion-only pose optimisation.

@@ -226,8 +226,11 @@ void local_bundle_adjustment(KeyFrame* kf,
     }
 
     // Anchor: if still no fixed KF, fix the local KF with the smallest id.
+    // The size() > 1 guard was removed: even with a single local KF we must
+    // fix it, otherwise g2o has full gauge freedom and the optimizer is free
+    // to move the pose (and all MPs) anywhere while keeping chi² unchanged.
     KeyFrame* anchor_kf = nullptr;
-    if (fixed_kf_set.empty() && local_kf_set.size() > 1) {
+    if (fixed_kf_set.empty()) {
         for (KeyFrame* lkf : local_kf_set) {
             if (!anchor_kf || lkf->id() < anchor_kf->id())
                 anchor_kf = lkf;
@@ -381,13 +384,40 @@ void local_bundle_adjustment(KeyFrame* kf,
     }
 
     // -----------------------------------------------------------------------
-    // 6. Write back optimised KF poses and MP positions.
+    // 6. Sanity-check the optimised result before touching any live data.
     //
-    //    No magnitude guard: the local window has fixed cameras (KFs that
-    //    observe local MPs but aren't being optimised) plus a fallback
-    //    smallest-id anchor when the map is small, so gauge is constrained
-    //    and large corrections are by construction legitimate.  Matches
-    //    ORB-SLAM2 LocalBundleAdjustment, which writes back unconditionally.
+    //    Two failure modes can produce a garbage solution even when the gauge
+    //    is anchored:
+    //      a) Pass 1 classifies nearly all edges as outliers → pass 2 runs
+    //         with almost no constraints and the free KF poses float away.
+    //      b) Numerically degenerate MPs cause the LM system to diverge
+    //         (produces NaN in the SE3 estimate).
+    //
+    //    Either way: bail out without touching KF poses or MP positions.
+    //    The next BA call (for the following KF) will start from the
+    //    un-corrupted state and is very likely to succeed.
+    // -----------------------------------------------------------------------
+    for (KeyFrame* lkf : local_kf_set) {
+        if (lkf == anchor_kf) continue;  // anchor is fixed — never moves
+        const auto* v = static_cast<const g2o::VertexSE3Expmap*>(
+            optimizer->vertex(kf_to_id.at(lkf)));
+        const Eigen::Matrix4d T_new = from_se3quat(v->estimate());
+        if (T_new.hasNaN()) return;  // numerical divergence — abort
+        const double dt =
+            (T_new.topRightCorner<3, 1>() -
+             lkf->get_pose().topRightCorner<3, 1>()).norm();
+        if (dt > p.max_kf_correction) return;  // catastrophic jump — abort
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. Write back optimised KF poses and MP positions.
+    //
+    //    No magnitude guard beyond the check above: the local window has
+    //    fixed cameras (KFs that observe local MPs but aren't being
+    //    optimised) plus a fallback smallest-id anchor when the map is
+    //    small, so gauge is constrained and large corrections are by
+    //    construction legitimate.  Matches ORB-SLAM2
+    //    LocalBundleAdjustment, which writes back unconditionally.
     // -----------------------------------------------------------------------
     // 8. Write back optimised poses and point positions, remove outlier obs.
     // -----------------------------------------------------------------------
