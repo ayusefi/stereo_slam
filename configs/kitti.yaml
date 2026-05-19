@@ -38,3 +38,4 @@ loop:
   max_candidates_per_kf: 3
   min_sim3_inlier_ratio: 0.15
   max_sim3_rmse_m: 50.0
+  max_pgo_adjacent_step_m: 12.0

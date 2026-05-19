@@ -57,6 +57,9 @@ class LoopClosing {
         double   min_sim3_inlier_ratio{0.15};
         /// Maximum Sim3 reprojection RMSE [metres] for sanity check.
         double   max_sim3_rmse_m{50.0};
+        /// Reject PGO previews that create an implausibly large adjacent-KF
+        /// jump in the optimized trajectory.
+        double   max_pgo_adjacent_step_m{12.0};
         /// Minimum KeyFrames between consecutive loop corrections.
         /// Prevents rapid re-triggering while the map is still being updated.
         uint64_t cooldown_kfs{20};

@@ -81,4 +81,8 @@ std::vector<const KeyFrame*> PlaceRecognizer::query(const KeyFrame* q)
     return confirmed;
 }
 
+void PlaceRecognizer::reset() {
+    prev_groups_.clear();
+}
+
 }  // namespace sslam

@@ -130,6 +130,8 @@ int main(int argc, char** argv) {
                 lc_params.min_sim3_inlier_ratio = static_cast<double>(fs["loop"]["min_sim3_inlier_ratio"]);
             if (!fs["loop"]["max_sim3_rmse_m"].empty())
                 lc_params.max_sim3_rmse_m = static_cast<double>(fs["loop"]["max_sim3_rmse_m"]);
+            if (!fs["loop"]["max_pgo_adjacent_step_m"].empty())
+                lc_params.max_pgo_adjacent_step_m = static_cast<double>(fs["loop"]["max_pgo_adjacent_step_m"]);
             if (!fs["loop"]["vocab_path"].empty())
                 vocab_path = static_cast<std::string>(fs["loop"]["vocab_path"]);
             // LocalMapping / BA params

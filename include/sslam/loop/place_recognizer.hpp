@@ -33,6 +33,10 @@ class PlaceRecognizer {
     ///           or empty if consistency has not been reached.
     std::vector<const KeyFrame*> query(const KeyFrame* q);
 
+    /// Clear temporal consistency state after a map correction changes the
+    /// covisibility graph.
+    void reset();
+
    private:
     KeyFrameDatabase& db_;
     double            min_score_;
