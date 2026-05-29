@@ -67,8 +67,20 @@ void MapPoint::compute_descriptor() {
     std::vector<cv::Mat> descs;
     {
         std::scoped_lock lk(obs_mutex_);
-        descs.reserve(observations_.size());
-        for (const auto& [kf, idx] : observations_) {
+        // Iterate observations in KeyFrame-id order.  observations_ is an
+        // unordered_map keyed by KeyFrame*, whose iteration order depends on
+        // pointer hashing (ASLR).  The representative-descriptor selection
+        // below keeps the first candidate on a median-distance tie, so an
+        // unstable order would pick different descriptors across runs and
+        // make BoW matching / loop detection non-deterministic.
+        std::vector<std::pair<KeyFrame*, int>> obs_sorted(
+            observations_.begin(), observations_.end());
+        std::sort(obs_sorted.begin(), obs_sorted.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.first->id() < b.first->id();
+                  });
+        descs.reserve(obs_sorted.size());
+        for (const auto& [kf, idx] : obs_sorted) {
             if (kf->is_bad()) continue;
             const cv::Mat row = kf->descriptors_left().row(idx);
             if (!row.empty())

@@ -198,15 +198,23 @@ void LoopClosing::run() {
             }
             kf = std::move(queue_.front());
             queue_.pop_front();
+            // Claim "processing" while still holding the queue lock.  If we
+            // deferred this to after the lock is released, there would be a
+            // window where the queue is empty and processing_ is still false,
+            // letting wait_until_idle() return prematurely — which makes the
+            // deterministic-mode drain race with loop processing.
+            processing_.store(true);
         }
 
-        if (!kf || kf->is_bad()) continue;
-        if (!kf->bow_computed()) continue;
+        if (!kf || kf->is_bad() || !kf->bow_computed()) {
+            processing_.store(false);
+            idle_cv_.notify_all();
+            continue;
+        }
 
         // Index this KF so future queries can match against it.
         db_->add(kf.get());
 
-        processing_.store(true);
         try {
             static std::atomic<int> lc_kf_count{0};
             const int kf_idx = ++lc_kf_count;
@@ -251,7 +259,8 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     if (scored.empty()) return false;
     std::sort(scored.begin(), scored.end(),
               [](const ScoredLoopCandidate& a, const ScoredLoopCandidate& b) {
-                  return a.score > b.score;
+                  if (a.score != b.score) return a.score > b.score;
+                  return a.kf->id() < b.kf->id();
               });
     if (static_cast<int>(scored.size()) > params_.max_candidates_per_kf)
         scored.resize(static_cast<std::size_t>(params_.max_candidates_per_kf));

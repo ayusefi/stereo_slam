@@ -122,8 +122,16 @@ std::vector<const KeyFrame*> KeyFrameDatabase::query_loop_candidates(
     sorted_accum.reserve(accum_scores.size());
     for (const auto& [kf, a] : accum_scores)
         if (a >= retain_thresh) sorted_accum.push_back({a, kf});
+    // Break score ties by KeyFrame id so the candidate ordering is
+    // independent of unordered_map iteration order (ASLR-dependent pointer
+    // hashing).  Without this, two groups with equal accumulated scores can
+    // swap positions across runs, changing which loop candidate fires first
+    // and making loop closures non-deterministic.
     std::sort(sorted_accum.begin(), sorted_accum.end(),
-              [](const auto& a, const auto& b) { return a.first > b.first; });
+              [](const auto& a, const auto& b) {
+                  if (a.first != b.first) return a.first > b.first;
+                  return a.second->id() < b.second->id();
+              });
 
     for (const auto& [accum, kf] : sorted_accum) {
         if (visited.count(kf)) continue;

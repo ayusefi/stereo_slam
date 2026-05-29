@@ -21,6 +21,7 @@
 #include <opencv2/core/eigen.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <shared_mutex>
 #include <stdexcept>
 #include <unordered_map>
@@ -448,10 +449,16 @@ bool Tracking::match_local_map_(
 {
     if (!last_kf_ || last_kf_->is_bad()) return false;
 
-    // Candidate set: last KF + up to 10 covisible neighbours.
+    // Candidate set: last KF + up to N covisible neighbours.
     // Viewing-angle, predicted-scale, and orientation-consistency guards
     // are applied below to suppress aliases.
-    constexpr int kMaxLocalKFs = 10;
+    static const int kMaxLocalKFs = []() {
+        if (const char* e = std::getenv("SSLAM_LOCAL_KFS")) {
+            const int v = std::atoi(e);
+            if (v >= 0) return v;
+        }
+        return 10;
+    }();
     std::vector<KeyFrame*> local_kfs{last_kf_.get()};
     {
         auto covis = last_kf_->get_covisibility_keyframes(0);

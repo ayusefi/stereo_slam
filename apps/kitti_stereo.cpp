@@ -17,6 +17,7 @@
 #include "sslam/loop/keyframe_database.hpp"
 #include "sslam/loop/loop_closing.hpp"
 #include "sslam/loop/loop_diagnostics.hpp"
+#include "sslam/optim/full_ba.hpp"
 #include "sslam/system.hpp"
 #include "sslam/tracking/tracking.hpp"
 #include "sslam/types/keyframe.hpp"
@@ -31,6 +32,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -202,6 +204,30 @@ int main(int argc, char** argv) {
         // from `tracker.resolved_trajectory()` after the run so that any
         // BA correction landed during processing is reflected.
 
+        // Deterministic mode (opt-in via SSLAM_DETERMINISTIC=1): after every
+        // frame, drain LocalMapping and LoopClosing so the next frame always
+        // sees a fully-settled map.  In the default concurrent mode, Tracking
+        // reads keyframe/map-point poses while LocalMapping is still refining
+        // them on another thread, so how much optimisation has "landed" by the
+        // time frame i is processed depends on wall-clock timing — which makes
+        // the trajectory differ from run to run.  Serialising the pipeline
+        // removes that timing dependence and yields bit-reproducible results
+        // (at the cost of real-time throughput), which is what we want for
+        // benchmarking and regression testing.
+        const char* det_env = std::getenv("SSLAM_DETERMINISTIC");
+        const bool deterministic = det_env && std::string(det_env) == "1";
+        if (deterministic) {
+            // Force OpenCV to run single-threaded.  cv::solvePnPRansac (used in
+            // tracking) distributes its RANSAC iterations across OpenCV's
+            // internal worker threads; that work split is non-deterministic, so
+            // near an inlier threshold two runs can pick different minimal
+            // samples and disagree on whether a frame is tracked or lost — after
+            // which the whole trajectory diverges.  Serialising OpenCV removes
+            // that source of run-to-run variation.
+            cv::setNumThreads(1);
+            std::cout << "Deterministic  : enabled (pipeline + OpenCV serialised)\n";
+        }
+
         for (std::size_t i = 0; i < std::min(loader.size(), max_frames); ++i) {
             const auto raw = loader.load(i);
 
@@ -312,6 +338,11 @@ int main(int argc, char** argv) {
                 cv::imshow(win, vis);
                 if (const int k = cv::waitKey(1); k == 27 || k == 'q') break;
             }
+
+            if (deterministic) {
+                tracker.local_mapping()->wait_until_idle();
+                if (loop_closer) loop_closer->wait_until_idle();
+            }
         }
 
         // End-of-sequence export should include tail keyframes.  Drain mapping
@@ -324,6 +355,33 @@ int main(int argc, char** argv) {
         tracker.local_mapping()->shutdown();
         if (loop_closer) loop_closer->shutdown();
         const auto ba_stats = tracker.local_mapping()->ba_stats();
+
+        // --- Final global bundle adjustment (opt-in) -------------------------
+        // A final batch BA over the whole map is the classic "Full BA" stage of
+        // ORB-SLAM2.  In this pipeline, however, benchmarking showed it
+        // *degrades* the trajectory on KITTI: on a loop-free sequence it only
+        // re-converges to the drifted estimate and adds noise (seq 07
+        // 1.65m -> 3.82m aligned), and even on a loop sequence it undoes part
+        // of the pose-graph correction (seq 00 3.35m -> 5.44m aligned).  The
+        // dominant accuracy lever here is the sparse essential-graph PGO run at
+        // loop-closure time, not a final global BA.  It is therefore disabled
+        // by default and only run when SSLAM_FINAL_BA=1 is set, for experiments.
+        const int n_loops_closed = loop_closer ? loop_closer->loop_count() : 0;
+        const char* ba_env = std::getenv("SSLAM_FINAL_BA");
+        const bool final_ba_enabled = ba_env && std::string(ba_env) == "1";
+        if (n_loops_closed > 0 && final_ba_enabled) {
+            std::cout << "Final global BA ... " << std::flush;
+            const auto t_ba0 = std::chrono::steady_clock::now();
+            sslam::FullBA full_ba(tracker.map());
+            full_ba.trigger();
+            full_ba.wait();
+            const auto t_ba1 = std::chrono::steady_clock::now();
+            std::cout << "done ("
+                      << static_cast<int>(
+                             std::chrono::duration<double, std::milli>(
+                                 t_ba1 - t_ba0).count())
+                      << " ms)\n";
+        }
 
         const std::size_t n_frames_run = std::min(loader.size(), max_frames);
         std::size_t active_kfs = 0;

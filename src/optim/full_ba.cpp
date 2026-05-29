@@ -12,6 +12,7 @@
 #include <Eigen/LU>
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <queue>
 #include <unordered_map>
@@ -149,7 +150,12 @@ void FullBA::run() {
             e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(
                 opt.vertex(kf_vid.at(kf_raw->id()))));
             e->setMeasurement(Eigen::Vector3d(kp.pt.x, kp.pt.y, u_r));
-            e->setInformation(Eigen::Matrix3d::Identity());
+            // Information matrix: I / sigma2[octave], sigma2 = scale_factor^(2*octave)
+            // with scale_factor = 1.2.  Coarse-pyramid observations are noisier and
+            // must be down-weighted, exactly as in local_bundle_adjustment().
+            constexpr double kScaleSq = 1.2 * 1.2;
+            const double sigma2 = std::pow(kScaleSq, kp.octave);
+            e->setInformation(Eigen::Matrix3d::Identity() * (1.0 / sigma2));
             auto* rk = new g2o::RobustKernelHuber();
             rk->setDelta(kHuberDelta);
             e->setRobustKernel(rk);

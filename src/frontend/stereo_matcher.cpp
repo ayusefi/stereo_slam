@@ -12,7 +12,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace sslam {
@@ -42,6 +44,17 @@ StereoMatcher::StereoMatcher(std::shared_ptr<const StereoCamera> cam,
     if (params_.max_disparity < 0.0f) {
         params_.max_disparity =
             static_cast<float>(cam_->fx * cam_->baseline / 0.5);
+    }
+    // Optional far-depth cap (experimental): reject low-disparity points whose
+    // stereo depth is over-estimated and inflates motion scale. Controlled via
+    // SSLAM_MAX_DEPTH (metres); converts to an equivalent min_disparity.
+    if (const char* md = std::getenv("SSLAM_MAX_DEPTH")) {
+        const double max_depth = std::atof(md);
+        if (max_depth > 0.0) {
+            const float min_disp =
+                static_cast<float>(cam_->fx * cam_->baseline / max_depth);
+            params_.min_disparity = std::max(params_.min_disparity, min_disp);
+        }
     }
 }
 

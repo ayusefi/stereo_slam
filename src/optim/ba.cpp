@@ -237,6 +237,23 @@ void local_bundle_adjustment(KeyFrame* kf,
         }
     }
 
+    // Deterministic iteration order.  The sets above are keyed by raw pointers,
+    // so iterating them directly yields an ASLR-dependent order.  That order
+    // decides which g2o vertex id each keyframe/map point receives and the
+    // sequence in which edges are added, which in turn changes the Hessian
+    // ordering and the floating-point summation order inside the solver — so
+    // the optimised poses differ from run to run even with identical input.
+    // Iterate id-sorted copies everywhere a deterministic result depends on it.
+    std::vector<KeyFrame*> local_kfs_sorted(local_kf_set.begin(), local_kf_set.end());
+    std::sort(local_kfs_sorted.begin(), local_kfs_sorted.end(),
+              [](const KeyFrame* a, const KeyFrame* b) { return a->id() < b->id(); });
+    std::vector<KeyFrame*> fixed_kfs_sorted(fixed_kf_set.begin(), fixed_kf_set.end());
+    std::sort(fixed_kfs_sorted.begin(), fixed_kfs_sorted.end(),
+              [](const KeyFrame* a, const KeyFrame* b) { return a->id() < b->id(); });
+    std::vector<MapPoint*> local_mps_sorted(local_mp_set.begin(), local_mp_set.end());
+    std::sort(local_mps_sorted.begin(), local_mps_sorted.end(),
+              [](const MapPoint* a, const MapPoint* b) { return a->id() < b->id(); });
+
     // -----------------------------------------------------------------------
     // 4. Build g2o graph.
     //    Schur-complement (sparse Eigen) solver for KF × MP block structure.
@@ -260,7 +277,7 @@ void local_bundle_adjustment(KeyFrame* kf,
     std::unordered_map<MapPoint*, int>  mp_to_id;
 
     // Local KF vertices (free, except the anchor if set)
-    for (KeyFrame* lkf : local_kf_set) {
+    for (KeyFrame* lkf : local_kfs_sorted) {
         auto* v = new g2o::VertexSE3Expmap();
         v->setId(next_id);
         v->setFixed(lkf == anchor_kf);
@@ -270,7 +287,7 @@ void local_bundle_adjustment(KeyFrame* kf,
     }
 
     // Fixed KF vertices
-    for (KeyFrame* fkf : fixed_kf_set) {
+    for (KeyFrame* fkf : fixed_kfs_sorted) {
         auto* v = new g2o::VertexSE3Expmap();
         v->setId(next_id);
         v->setFixed(true);
@@ -280,7 +297,7 @@ void local_bundle_adjustment(KeyFrame* kf,
     }
 
     // MP vertices
-    for (MapPoint* mp : local_mp_set) {
+    for (MapPoint* mp : local_mps_sorted) {
         auto* v = new g2o::VertexPointXYZ();
         v->setId(next_id);
         v->setFixed(false);
@@ -302,9 +319,14 @@ void local_bundle_adjustment(KeyFrame* kf,
 
     const double bf = cam.fx * cam.baseline;
 
-    for (MapPoint* mp : local_mp_set) {
+    for (MapPoint* mp : local_mps_sorted) {
         const int mp_id = mp_to_id.at(mp);
-        for (const auto& [obs_kf, feat_idx] : mp->get_observations()) {
+        // Sort observations by keyframe id so edges are added in a stable order.
+        const auto obs_map = mp->get_observations();
+        std::vector<std::pair<KeyFrame*, int>> obs_sorted(obs_map.begin(), obs_map.end());
+        std::sort(obs_sorted.begin(), obs_sorted.end(),
+                  [](const auto& a, const auto& b) { return a.first->id() < b.first->id(); });
+        for (const auto& [obs_kf, feat_idx] : obs_sorted) {
             if (!obs_kf || obs_kf->is_bad()) continue;
             if (kf_to_id.count(obs_kf) == 0) continue;
 
@@ -359,7 +381,7 @@ void local_bundle_adjustment(KeyFrame* kf,
         // Only reset estimates on the first pass; pass 2 starts from pass 1's
         // result (already stored in the g2o vertices).
         if (pass == 0) {
-            for (KeyFrame* lkf : local_kf_set)
+            for (KeyFrame* lkf : local_kfs_sorted)
                 static_cast<g2o::VertexSE3Expmap*>(
                     optimizer->vertex(kf_to_id.at(lkf)))
                     ->setEstimate(to_se3quat(lkf->get_pose()));
@@ -397,7 +419,7 @@ void local_bundle_adjustment(KeyFrame* kf,
     //    The next BA call (for the following KF) will start from the
     //    un-corrupted state and is very likely to succeed.
     // -----------------------------------------------------------------------
-    for (KeyFrame* lkf : local_kf_set) {
+    for (KeyFrame* lkf : local_kfs_sorted) {
         if (lkf == anchor_kf) continue;  // anchor is fixed — never moves
         const auto* v = static_cast<const g2o::VertexSE3Expmap*>(
             optimizer->vertex(kf_to_id.at(lkf)));
@@ -421,13 +443,13 @@ void local_bundle_adjustment(KeyFrame* kf,
     // -----------------------------------------------------------------------
     // 8. Write back optimised poses and point positions, remove outlier obs.
     // -----------------------------------------------------------------------
-    for (KeyFrame* lkf : local_kf_set) {
+    for (KeyFrame* lkf : local_kfs_sorted) {
         const auto* v = static_cast<const g2o::VertexSE3Expmap*>(
             optimizer->vertex(kf_to_id.at(lkf)));
         lkf->set_pose(from_se3quat(v->estimate()));
     }
 
-    for (MapPoint* mp : local_mp_set) {
+    for (MapPoint* mp : local_mps_sorted) {
         const auto* v = static_cast<const g2o::VertexPointXYZ*>(
             optimizer->vertex(mp_to_id.at(mp)));
         mp->set_world_pos(v->estimate());
@@ -442,9 +464,9 @@ void local_bundle_adjustment(KeyFrame* kf,
         }
     }
 
-    for (KeyFrame* lkf : local_kf_set)
+    for (KeyFrame* lkf : local_kfs_sorted)
         lkf->update_connections();
-    for (KeyFrame* fkf : fixed_kf_set)
+    for (KeyFrame* fkf : fixed_kfs_sorted)
         fkf->update_connections();
 }
 

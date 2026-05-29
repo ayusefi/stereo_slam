@@ -266,8 +266,19 @@ std::vector<KeyFrame*> KeyFrame::get_covisibility_keyframes(int min_weight) cons
     for (const auto& [kf, w] : covisibility_)
         if (w >= min_weight) sorted.emplace_back(w, kf);
 
+    // Sort by weight descending.  `covisibility_` is a pointer-keyed
+    // unordered_map, so iterating it yields an ASLR-dependent order; if we only
+    // compared weights, keyframes with equal covisibility weight would come out
+    // in a different order on every run.  That ordering propagates into the
+    // local-BA window, TrackLocalMap neighbour set and triangulation peers, so
+    // a non-deterministic tie-break makes the whole trajectory irreproducible.
+    // Break ties on the (stable, monotonically assigned) keyframe id to impose
+    // a total order independent of memory layout.
     std::sort(sorted.begin(), sorted.end(),
-              [](const auto& a, const auto& b) { return a.first > b.first; });
+              [](const auto& a, const auto& b) {
+                  if (a.first != b.first) return a.first > b.first;
+                  return a.second->id() < b.second->id();
+              });
 
     std::vector<KeyFrame*> result;
     result.reserve(sorted.size());

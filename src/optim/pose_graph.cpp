@@ -3,7 +3,7 @@
 #include <g2o/core/block_solver.h>
 #include <g2o/core/optimization_algorithm_levenberg.h>
 #include <g2o/core/sparse_optimizer.h>
-#include <g2o/solvers/dense/linear_solver_dense.h>
+#include <g2o/solvers/eigen/linear_solver_eigen.h>
 #include <g2o/types/sim3/types_seven_dof_expmap.h>
 
 #include <Eigen/Geometry>
@@ -54,8 +54,14 @@ CorrectionStats optimize_impl(Map& map,
                               bool write_back) {
     CorrectionStats stats;
 
-    using BlockSolverType  = g2o::BlockSolverX;
-    using LinearSolverType = g2o::LinearSolverDense<BlockSolverType::PoseMatrixType>;
+    // Sparse essential-graph optimisation.  Sim3 vertices have 7 DOF, so use
+    // the 7_3 block solver with an Eigen sparse linear solver.  A dense solver
+    // here is O((7N)^3) per iteration and stalls for minutes once the map has
+    // hundreds of keyframes; the sparse Cholesky factorisation exploits the
+    // graph sparsity (each KF connects to a handful of covisible neighbours)
+    // and runs in well under a second, matching ORB-SLAM2's OptimizeEssentialGraph.
+    using BlockSolverType  = g2o::BlockSolver_7_3;
+    using LinearSolverType = g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType>;
 
     auto linear = std::make_unique<LinearSolverType>();
     auto block  = std::make_unique<BlockSolverType>(std::move(linear));
