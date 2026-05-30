@@ -2,6 +2,8 @@
 #include "sslam/types/keyframe.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <unordered_set>
 
 namespace sslam {
@@ -77,6 +79,15 @@ std::vector<const KeyFrame*> PlaceRecognizer::query(const KeyFrame* q)
     for (std::size_t i = 0; i < cur_groups.size(); ++i) {
         if (consistency[i] >= kConsistencyTh)
             confirmed.push_back(cur_groups[i][0]);  // [0] is the DB best-per-group KF
+    }
+    if (const char* dbg = std::getenv("SSLAM_LOOP_DEBUG");
+        dbg && dbg[0] == '1' && !raw.empty()) {
+        int max_consist = 0;
+        for (int c : consistency) max_consist = std::max(max_consist, c);
+        std::fprintf(stderr,
+                     "[PR] q=%lu raw=%zu groups=%zu max_consist=%d confirmed=%zu\n",
+                     static_cast<unsigned long>(q->id()), raw.size(),
+                     cur_groups.size(), max_consist, confirmed.size());
     }
     return confirmed;
 }

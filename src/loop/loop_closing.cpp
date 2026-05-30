@@ -11,6 +11,8 @@
 #include <Eigen/LU>
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -242,6 +244,16 @@ bool LoopClosing::try_close_loop(KeyFrame* q) {
     // Helper: flush one attempt record to the optional logger.
     auto log_attempt = [&](const LoopAttemptStats& s) {
         if (logger_) logger_->record(s);
+        if (const char* dbg = std::getenv("SSLAM_LOOP_DEBUG"); dbg && dbg[0] == '1') {
+            std::fprintf(stderr,
+                         "[LCattempt] q=%lu cand=%lu bow_score=%.3f bow_m=%d "
+                         "sim3_in=%d ratio=%.2f rmse=%.2f reason=%s\n",
+                         static_cast<unsigned long>(s.query_kf_id),
+                         static_cast<unsigned long>(s.candidate_kf_id),
+                         s.bow_score, s.bow_matches, s.sim3_inliers,
+                         s.sim3_inlier_ratio, s.sim3_rmse_m,
+                         s.reject_reason.empty() ? "OK" : s.reject_reason.c_str());
+        }
     };
 
     // 1. Place recognition with temporal consistency filter.

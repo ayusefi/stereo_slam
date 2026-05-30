@@ -1,6 +1,7 @@
 #include "sslam/optim/sim3_solver.hpp"
 
 #include <Eigen/Dense>
+#include <cmath>
 #include <random>
 
 namespace sslam {
@@ -213,6 +214,11 @@ Sim3Solver::Result Sim3Solver::solve() {
         } else {
             if (s <= 0.0 || s > 100.0) continue;  // degenerate scale
         }
+        // Reject degenerate (e.g. collinear-triple) hypotheses that produce a
+        // non-finite rotation/translation. Without this guard a NaN hypothesis
+        // would pass every "> threshold" inlier test (NaN compares false) and
+        // be counted as a perfect fit, poisoning the RANSAC result.
+        if (!R.allFinite() || !t.allFinite() || !std::isfinite(s)) continue;
 
         std::vector<bool> mask;
         const int n_in = count_inliers(s, R, t, mask);
@@ -229,6 +235,11 @@ Sim3Solver::Result Sim3Solver::solve() {
 
     // Refine over the full inlier set.
     refine(best.scale, best.R, best.t, best.inlier_mask);
+    // Guard against a degenerate refinement producing a non-finite estimate.
+    if (!best.R.allFinite() || !best.t.allFinite() ||
+        !std::isfinite(best.scale)) {
+        return {};
+    }
     // Re-count after refinement.
     best.n_inliers = count_inliers(best.scale, best.R, best.t,
                                     best.inlier_mask);
