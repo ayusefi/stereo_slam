@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <queue>
 #include <unordered_map>
@@ -58,6 +59,16 @@ void FullBA::run() {
     // Huber delta for a 3-DoF stereo residual: sqrt(chi2_3dof at 95th pct).
     constexpr double kHuberDelta = 2.7955;  // sqrt(7.815)
     constexpr double kChi2Th    = 7.815;
+    // The final pass runs on the reclassified inlier set.  A deterministic
+    // sweep found 20 iterations to be the best loop-sequence tradeoff; keep an
+    // env hook for diagnostics without changing normal defaults.
+    static const int kFinalIterations = []() {
+        if (const char* env = std::getenv("SSLAM_FULL_BA_FINAL_ITERS")) {
+            const int parsed = std::atoi(env);
+            if (parsed > 0) return parsed;
+        }
+        return 20;
+    }();
     // Uses the same g2o setup as local BA but with all KFs as vertices,
     // KF id=0 fixed as the gauge anchor.
     //
@@ -172,7 +183,7 @@ void FullBA::run() {
     for (int outer = 0; outer < 2; ++outer) {
         if (cancel_.load()) return;
         opt.initializeOptimization(0);
-        opt.optimize(10);
+        opt.optimize(outer == 0 ? 10 : kFinalIterations);
         if (cancel_.load()) return;
         for (auto* e : edges) {
             if (e->level() == 0 && e->chi2() > kChi2Th)
