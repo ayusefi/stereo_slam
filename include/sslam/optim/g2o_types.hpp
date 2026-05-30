@@ -17,5 +17,6 @@
 #include <g2o/solvers/eigen/linear_solver_eigen.h>
 #include <g2o/types/sba/edge_project_stereo_xyz.h>
 #include <g2o/types/sba/edge_project_stereo_xyz_onlypose.h>
+#include <g2o/types/sba/edge_project_xyz_onlypose.h>
 #include <g2o/types/sba/types_six_dof_expmap.h>
 #include <g2o/types/sba/vertex_se3_expmap.h>

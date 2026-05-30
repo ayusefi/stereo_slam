@@ -32,6 +32,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -89,39 +91,83 @@ PoseOptResult optimize_pose(
     optimizer->addVertex(v);
 
     // --- Build edges -------------------------------------------------------
-    std::vector<g2o::EdgeStereoSE3ProjectXYZOnlyPose*> edges;
-    edges.reserve(static_cast<std::size_t>(n));
+    // Close/far split (ORB-SLAM2 §III-A): a stereo point whose measured depth
+    // exceeds th_depth has a disparity too small to trust for scale, so its
+    // right-image (u_r) constraint injects scale bias.  Such "far" points are
+    // optimised as monocular edges — they still constrain rotation/direction
+    // via (u_l, v) but no longer pull the pose translation toward an
+    // unreliable depth.  th_depth is read from SSLAM_TH_DEPTH (metres); when
+    // unset the split is disabled and every point stays a stereo edge.
+    double th_depth = std::numeric_limits<double>::infinity();
+    if (const char* env = std::getenv("SSLAM_TH_DEPTH")) {
+        const double mv = std::atof(env);
+        if (mv > 0.0) th_depth = mv;
+    }
+
+    struct EdgeRec {
+        g2o::OptimizableGraph::Edge* edge;
+        double chi2_thr;
+        int    idx;
+    };
+    std::vector<EdgeRec> recs;
+    recs.reserve(static_cast<std::size_t>(n));
 
     const double bf = cam.fx * cam.baseline;
-    constexpr double kScaleSq = 1.2 * 1.2;
+    constexpr double kScaleSq  = 1.2 * 1.2;
+    constexpr double kChi2Mono = 5.991;  // 2-DOF 95% threshold
 
     for (int i = 0; i < n; ++i) {
-        auto* e = new g2o::EdgeStereoSE3ProjectXYZOnlyPose();
+        const Eigen::Vector3d& obs = obs_stereo[static_cast<std::size_t>(i)];
 
-        e->setVertex(0, v);
-        e->setMeasurement(obs_stereo[static_cast<std::size_t>(i)]);
-
-        // Information matrix: I / sigma2[octave].
-        // sigma2[octave] = (scale_factor)^(2*octave), scale_factor = 1.2.
+        // Information matrix scale: I / sigma2[octave].
         const int oct = (!octaves.empty() && i < static_cast<int>(octaves.size()))
                         ? octaves[static_cast<std::size_t>(i)] : 0;
         const double sigma2 = std::pow(kScaleSq, oct);
-        e->setInformation(Eigen::Matrix3d::Identity() * (1.0 / sigma2));
 
-        // g2o takes ownership of the kernel pointer; allocate one per edge.
-        auto* rk = new g2o::RobustKernelHuber();
-        rk->setDelta(p.huber_delta);
-        e->setRobustKernel(rk);
+        const double disp  = obs[0] - obs[2];
+        const double depth = (disp > 1e-6) ? (bf / disp)
+                                           : std::numeric_limits<double>::infinity();
 
-        e->Xw = pts3d[static_cast<std::size_t>(i)];
-        e->fx  = cam.fx;
-        e->fy  = cam.fy;
-        e->cx  = cam.cx;
-        e->cy  = cam.cy;
-        e->bf  = bf;
+        if (depth > th_depth) {
+            // --- Far point: monocular edge -------------------------------
+            auto* e = new g2o::EdgeSE3ProjectXYZOnlyPose();
+            e->setVertex(0, v);
+            e->setMeasurement(Eigen::Vector2d(obs[0], obs[1]));
+            e->setInformation(Eigen::Matrix2d::Identity() * (1.0 / sigma2));
 
-        optimizer->addEdge(e);
-        edges.push_back(e);
+            auto* rk = new g2o::RobustKernelHuber();
+            rk->setDelta(std::sqrt(kChi2Mono));
+            e->setRobustKernel(rk);
+
+            e->Xw = pts3d[static_cast<std::size_t>(i)];
+            e->fx = cam.fx;
+            e->fy = cam.fy;
+            e->cx = cam.cx;
+            e->cy = cam.cy;
+
+            optimizer->addEdge(e);
+            recs.push_back({e, kChi2Mono, i});
+        } else {
+            // --- Close point: stereo edge --------------------------------
+            auto* e = new g2o::EdgeStereoSE3ProjectXYZOnlyPose();
+            e->setVertex(0, v);
+            e->setMeasurement(obs);
+            e->setInformation(Eigen::Matrix3d::Identity() * (1.0 / sigma2));
+
+            auto* rk = new g2o::RobustKernelHuber();
+            rk->setDelta(p.huber_delta);
+            e->setRobustKernel(rk);
+
+            e->Xw = pts3d[static_cast<std::size_t>(i)];
+            e->fx = cam.fx;
+            e->fy = cam.fy;
+            e->cx = cam.cx;
+            e->cy = cam.cy;
+            e->bf = bf;
+
+            optimizer->addEdge(e);
+            recs.push_back({e, p.chi2_threshold, i});
+        }
     }
 
     // --- 4 outer × 10 inner iterations with inlier reclassification --------
@@ -136,20 +182,19 @@ PoseOptResult optimize_pose(
 
         // Reclassify edges; outliers → level 1 (excluded next iter)
         n_inliers = 0;
-        for (auto* e : edges) {
-            e->computeError();
-            const double chi2 = e->chi2();
-            if (chi2 < p.chi2_threshold) {
-                e->setLevel(0);   // inlier
+        for (auto& r : recs) {
+            r.edge->computeError();
+            const double chi2 = r.edge->chi2();
+            if (chi2 < r.chi2_thr) {
+                r.edge->setLevel(0);   // inlier
                 ++n_inliers;
             } else {
-                e->setLevel(1);   // outlier — excluded from next LM step
+                r.edge->setLevel(1);   // outlier — excluded from next LM step
             }
             // Drop the Huber kernel on the penultimate outer so the final
             // pass is a clean Gauss-Newton step on the inlier set.
-            // setRobustKernel(nullptr) frees the heap-allocated kernel.
             if (outer == p.outer_iterations - 2) {
-                e->setRobustKernel(nullptr);
+                r.edge->setRobustKernel(nullptr);
             }
         }
 
@@ -160,9 +205,9 @@ PoseOptResult optimize_pose(
     PoseOptResult result;
     result.T_cw      = from_se3quat(v->estimate());
     result.n_inliers = n_inliers;
-    result.inlier_mask.resize(static_cast<std::size_t>(n));
-    for (int i = 0; i < n; ++i)
-        result.inlier_mask[static_cast<std::size_t>(i)] = (edges[static_cast<std::size_t>(i)]->level() == 0);
+    result.inlier_mask.assign(static_cast<std::size_t>(n), false);
+    for (auto& r : recs)
+        result.inlier_mask[static_cast<std::size_t>(r.idx)] = (r.edge->level() == 0);
     return result;
 }
 
@@ -419,16 +464,32 @@ void local_bundle_adjustment(KeyFrame* kf,
     //    The next BA call (for the following KF) will start from the
     //    un-corrupted state and is very likely to succeed.
     // -----------------------------------------------------------------------
+    // Optional override of the catastrophic-jump threshold for diagnosis:
+    //   SSLAM_MAX_KF_CORR=<metres>  (<=0 disables the magnitude guard entirely;
+    //   the NaN guard always stays active).
+    double max_kf_corr = p.max_kf_correction;
+    static const double kEnvKfCorr = []() {
+        if (const char* e = std::getenv("SSLAM_MAX_KF_CORR")) return std::atof(e);
+        return -2.0;  // sentinel: not set
+    }();
+    if (kEnvKfCorr > -1.5) max_kf_corr = kEnvKfCorr;
     for (KeyFrame* lkf : local_kfs_sorted) {
         if (lkf == anchor_kf) continue;  // anchor is fixed — never moves
         const auto* v = static_cast<const g2o::VertexSE3Expmap*>(
             optimizer->vertex(kf_to_id.at(lkf)));
         const Eigen::Matrix4d T_new = from_se3quat(v->estimate());
         if (T_new.hasNaN()) return;  // numerical divergence — abort
-        const double dt =
-            (T_new.topRightCorner<3, 1>() -
-             lkf->get_pose().topRightCorner<3, 1>()).norm();
-        if (dt > p.max_kf_correction) return;  // catastrophic jump — abort
+        if (max_kf_corr > 0.0) {
+            const double dt =
+                (T_new.topRightCorner<3, 1>() -
+                 lkf->get_pose().topRightCorner<3, 1>()).norm();
+            if (dt > max_kf_corr) {  // catastrophic jump — abort
+                std::fprintf(stderr,
+                             "[BA] writeback ABORT kf=%ld dt=%.3f > %.3f\n",
+                             static_cast<long>(kf->id()), dt, max_kf_corr);
+                return;
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

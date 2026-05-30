@@ -23,7 +23,7 @@ tracking:
   keyframe_min_inlier_ratio: 0.75
 
 local_mapping:
-  local_ba_keyframe_window: 10
+  local_ba_keyframe_window: 15
   cull_redundant_kfs: true
 
 loop:
