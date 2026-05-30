@@ -32,13 +32,13 @@ cmake --build build -j$(nproc)
 
 | Seq | Frames | ATE (aligned) | Loop closures |
 |-----|--------|---------------|---------------|
-| 00  | 4541   | 3.95 m        | 5             |
-| 02  | 4661   | 6.91 m        | 1             |
-| 05  | 2761   | 1.24 m        | 3             |
+| 00  | 4541   | 2.90 m        | 5             |
+| 02  | 4661   | 6.95 m        | 1             |
+| 05  | 2761   | 1.07 m        | 3             |
 | 07  | 1101   | 3.44 m        | 0             |
 | 08  | 4071   | 9.35 m        | 0             |
 
-> Deterministic benchmark (`SSLAM_DETERMINISTIC=1`, local BA window = 15).
+> Deterministic benchmark (`SSLAM_DETERMINISTIC=1`, local BA window = 15, final BA enabled for loop sequences with 20 final iterations).
 > ATE = Absolute Trajectory Error after Umeyama alignment.
 
 ### KITTI Seq 00 — Pangolin Map Viewer
